@@ -196,11 +196,15 @@
 #define OPAL_XIVE_SET_VP_INFO			138
 #define OPAL_XIVE_ALLOCATE_IRQ			139
 #define OPAL_XIVE_FREE_IRQ			140
-#define OPAL_XIVE_RESERVED1			141
-#define OPAL_XIVE_RESERVED2			142
+#define OPAL_XIVE_SYNC				141
+#define OPAL_XIVE_DUMP				142
 #define OPAL_XIVE_RESERVED3			143
 #define OPAL_XIVE_RESERVED4			144
-#define OPAL_LAST				144
+#define OPAL_SIGNAL_SYSTEM_RESET		145
+#define OPAL_NPU_INIT_CONTEXT			146
+#define OPAL_NPU_DESTROY_CONTEXT		147
+#define OPAL_NPU_MAP_LPAR			148
+#define OPAL_LAST				148
 
 /* Device tree flags */
 
@@ -1125,6 +1129,23 @@ enum {
 /* "Any chip" replacement for chip ID for allocation functions */
 enum {
 	OPAL_XIVE_ANY_CHIP		= 0xffffffff,
+};
+
+/* Xive sync options */
+enum {
+	/* This bits are cumulative, arg is a girq */
+	XIVE_SYNC_EAS			= 0x00000001, /* Sync irq source */
+	XIVE_SYNC_QUEUE			= 0x00000002, /* Sync irq target */
+};
+
+/* Dump options */
+enum {
+	XIVE_DUMP_TM_HYP	= 0,
+	XIVE_DUMP_TM_POOL	= 1,
+	XIVE_DUMP_TM_OS		= 2,
+	XIVE_DUMP_TM_USER	= 3,
+	XIVE_DUMP_VP		= 4,
+	XIVE_DUMP_EMU_STATE	= 5,
 };
 
 #endif /* __ASSEMBLY__ */

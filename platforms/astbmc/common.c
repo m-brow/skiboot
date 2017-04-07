@@ -39,6 +39,11 @@
 #define BT_IO_COUNT	3
 #define BT_LPC_IRQ	10
 
+/* MBOX config */
+#define MBOX_IO_BASE 0x1000
+#define MBOX_IO_COUNT 6
+#define MBOX_LPC_IRQ 9
+
 void astbmc_ext_irq_serirq_cpld(unsigned int chip_id)
 {
 	lpc_all_interrupts(chip_id);
@@ -191,6 +196,36 @@ static void astbmc_fixup_dt_bt(struct dt_node *lpc)
 	dt_add_property_cells(bt, "interrupt-parent", lpc->phandle);
 }
 
+static void astbmc_fixup_dt_mbox(struct dt_node *lpc)
+{
+	struct dt_node *mbox;
+	char namebuf[32];
+
+	/* All P9 machines have this and no earlier machines do */
+	if (proc_gen != proc_gen_p9)
+		return;
+
+	/* First check if the mbox interface is already there */
+	dt_for_each_child(lpc, mbox) {
+		if (dt_node_is_compatible(mbox, "mbox"))
+			return;
+	}
+
+	snprintf(namebuf, sizeof(namebuf), "mbox@i%x", MBOX_IO_BASE);
+	mbox = dt_new(lpc, namebuf);
+
+	dt_add_property_cells(mbox, "reg",
+			      1, /* IO space */
+			      MBOX_IO_BASE, MBOX_IO_COUNT);
+	dt_add_property_strings(mbox, "compatible", "mbox");
+
+	/* Mark it as reserved to avoid Linux trying to claim it */
+	dt_add_property_strings(mbox, "status", "reserved");
+
+	dt_add_property_cells(mbox, "interrupts", MBOX_LPC_IRQ);
+	dt_add_property_cells(mbox, "interrupt-parent", lpc->phandle);
+}
+
 static void astbmc_fixup_dt_uart(struct dt_node *lpc)
 {
 	/*
@@ -278,6 +313,12 @@ static void astbmc_fixup_dt(void)
 		if (dt_has_node_property(n, "#address-cells", NULL))
 			break;
 	}
+	dt_for_each_compatible(dt_root, n, "ibm,power9-lpc") {
+		if (!primary_lpc || dt_has_node_property(n, "primary", NULL))
+			primary_lpc = n;
+		if (dt_has_node_property(n, "#address-cells", NULL))
+			break;
+	}
 
 	if (!primary_lpc)
 		return;
@@ -287,6 +328,9 @@ static void astbmc_fixup_dt(void)
 
 	/* BT is not in HB either */
 	astbmc_fixup_dt_bt(primary_lpc);
+
+	/* MBOX is not in HB */
+	astbmc_fixup_dt_mbox(primary_lpc);
 
 	/* The pel logging code needs a system-id property to work so
 	   make sure we have one. */
@@ -299,6 +343,10 @@ static void astbmc_fixup_psi_bar(void)
 {
 	struct proc_chip *chip = next_chip(NULL);
 	uint64_t psibar;
+
+	/* This is P8 specific */
+	if (proc_gen != proc_gen_p8)
+		return;
 
 	/* Read PSI BAR */
 	if (xscom_read(chip->id, 0x201090A, &psibar)) {
@@ -321,17 +369,11 @@ static void astbmc_fixup_psi_bar(void)
 
 void astbmc_early_init(void)
 {
-	/*
-	 * On P9 we don't have a HB supplied devicetree and we have a
-	 * different PSI BAR hack here is P8 specific.
-	 */
-	if (proc_gen == proc_gen_p8) {
-		/* Hostboot's device-tree isn't quite right yet */
-		astbmc_fixup_dt();
+	/* Hostboot's device-tree isn't quite right yet */
+	astbmc_fixup_dt();
 
-		/* Hostboot forgets to populate the PSI BAR */
-		astbmc_fixup_psi_bar();
-	}
+	/* Hostboot forgets to populate the PSI BAR */
+	astbmc_fixup_psi_bar();
 
 	/* Send external interrupts to me */
 	psi_set_external_irq_policy(EXTERNAL_IRQ_POLICY_SKIBOOT);
@@ -357,8 +399,12 @@ void astbmc_early_init(void)
 	/* Similarly, some BMCs don't configure the BT interrupt properly */
 	ast_setup_ibt(BT_IO_BASE, BT_LPC_IRQ);
 
+	ast_setup_sio_mbox(MBOX_IO_BASE, MBOX_LPC_IRQ);
+
 	/* Setup UART and use it as console */
 	uart_init();
+
+	mbox_init();
 
 	prd_init();
 }

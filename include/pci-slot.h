@@ -146,6 +146,8 @@ struct pci_slot_ops {
 struct pci_slot {
 	uint32_t		flags;
 #define PCI_SLOT_FLAG_BOOTUP		0x1
+#define PCI_SLOT_FLAG_FORCE_POWERON	0x2
+#define PCI_SLOT_FLAG_BROKEN_PDC	0x4
 
 	struct phb		*phb;
 	struct pci_device	*pd;
@@ -176,6 +178,7 @@ struct pci_slot {
 	 */
 	uint32_t		state;
 	uint32_t		retry_state;
+	uint16_t		pcie_cap;
 	uint32_t		link_cap;
 	uint32_t		slot_cap;
 	uint64_t		delay_tgt_tb;

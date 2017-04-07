@@ -18,7 +18,9 @@
 #include <cpu.h>
 #include <pci.h>
 #include <pci-cfg.h>
+#include <pci-iov.h>
 #include <pci-slot.h>
+#include <pci-quirk.h>
 #include <timebase.h>
 #include <device.h>
 #include <fsp.h>
@@ -130,14 +132,90 @@ int64_t pci_find_ecap(struct phb *phb, uint16_t bdfn, uint16_t want,
 	return OPAL_UNSUPPORTED;
 }
 
+static void pci_init_pcie_cap(struct phb *phb, struct pci_device *pd)
+{
+	int64_t ecap = 0;
+	uint16_t reg;
+	uint32_t val;
+
+	/* On the upstream port of PLX bridge 8724 (rev ba), PCI_STATUS
+	 * register doesn't have capability indicator though it support
+	 * various PCI capabilities. So we need ignore that bit when
+	 * looking for PCI capabilities on the upstream port, which is
+	 * limited to one that seats directly under root port.
+	 */
+	if (pd->vdid == 0x872410b5 && pd->parent && !pd->parent->parent) {
+		uint8_t rev;
+
+		pci_cfg_read8(phb, pd->bdfn, PCI_CFG_REV_ID, &rev);
+		if (rev == 0xba)
+			ecap = __pci_find_cap(phb, pd->bdfn,
+					      PCI_CFG_CAP_ID_EXP, false);
+		else
+			ecap = pci_find_cap(phb, pd->bdfn, PCI_CFG_CAP_ID_EXP);
+	} else {
+		ecap = pci_find_cap(phb, pd->bdfn, PCI_CFG_CAP_ID_EXP);
+	}
+
+	if (ecap <= 0) {
+		pd->dev_type = PCIE_TYPE_LEGACY;
+		return;
+	}
+
+	pci_set_cap(pd, PCI_CFG_CAP_ID_EXP, ecap, NULL, false);
+
+	/*
+	 * XXX We observe a problem on some PLX switches where one
+	 * of the downstream ports appears as an upstream port, we
+	 * fix that up here otherwise, other code will misbehave
+	 */
+	pci_cfg_read16(phb, pd->bdfn, ecap + PCICAP_EXP_CAPABILITY_REG, &reg);
+	pd->dev_type = GETFIELD(PCICAP_EXP_CAP_TYPE, reg);
+	if (pd->parent && pd->dev_type == PCIE_TYPE_SWITCH_UPPORT &&
+	    pd->parent->dev_type == PCIE_TYPE_SWITCH_UPPORT &&
+	    pd->vdid == 0x874810b5) {
+		PCIDBG(phb, pd->bdfn, "Fixing up bad PLX downstream port !\n");
+		pd->dev_type = PCIE_TYPE_SWITCH_DNPORT;
+	}
+
+	/* XXX Handle ARI */
+	if (pd->dev_type == PCIE_TYPE_SWITCH_DNPORT ||
+	    pd->dev_type == PCIE_TYPE_ROOT_PORT)
+		pd->scan_map = 0x1;
+
+	/* Read MPS capability, whose maximal size is 4096 */
+	pci_cfg_read32(phb, pd->bdfn, ecap + PCICAP_EXP_DEVCAP, &val);
+	pd->mps = (128 << GETFIELD(PCICAP_EXP_DEVCAP_MPSS, val));
+	if (pd->mps > 4096)
+		pd->mps = 4096;
+}
+
+static void pci_init_aer_cap(struct phb *phb, struct pci_device *pd)
+{
+	int64_t pos;
+
+	if (!pci_has_cap(pd, PCI_CFG_CAP_ID_EXP, false))
+		return;
+
+	pos = pci_find_ecap(phb, pd->bdfn, PCIECAP_ID_AER, NULL);
+	if (pos > 0)
+		pci_set_cap(pd, PCIECAP_ID_AER, pos, NULL, true);
+}
+
+void pci_init_capabilities(struct phb *phb, struct pci_device *pd)
+{
+	pci_init_pcie_cap(phb, pd);
+	pci_init_aer_cap(phb, pd);
+	pci_init_iov_cap(phb, pd);
+}
+
 static struct pci_device *pci_scan_one(struct phb *phb, struct pci_device *parent,
 				       uint16_t bdfn)
 {
 	struct pci_device *pd = NULL;
-	uint32_t retries, vdid, val;
-	int64_t rc, ecap;
+	uint32_t retries, vdid;
+	int64_t rc;
 	uint8_t htype;
-	uint16_t capreg;
 	bool had_crs = false;
 
 	for (retries = 0; retries < 40; retries++) {
@@ -188,56 +266,7 @@ static struct pci_device *pci_scan_one(struct phb *phb, struct pci_device *paren
 	pd->scan_map = 0xffffffff; /* Default */
 	pd->primary_bus = (bdfn >> 8);
 
-	/* On the upstream port of PLX bridge 8724 (rev ba), PCI_STATUS
-	 * register doesn't have capability indicator though it support
-	 * various PCI capabilities. So we need ignore that bit when
-	 * looking for PCI capabilities on the upstream port, which is
-	 * limited to one that seats directly under root port.
-	 */
-	if (vdid == 0x872410b5 && parent && !parent->parent) {
-		uint8_t rev;
-
-		pci_cfg_read8(phb, bdfn, PCI_CFG_REV_ID, &rev);
-		if (rev == 0xba)
-			ecap = __pci_find_cap(phb, bdfn,
-					      PCI_CFG_CAP_ID_EXP, false);
-		else
-			ecap = pci_find_cap(phb, bdfn, PCI_CFG_CAP_ID_EXP);
-	} else {
-		ecap = pci_find_cap(phb, bdfn, PCI_CFG_CAP_ID_EXP);
-	}
-	if (ecap > 0) {
-		pci_set_cap(pd, PCI_CFG_CAP_ID_EXP, ecap, false);
-		pci_cfg_read16(phb, bdfn, ecap + PCICAP_EXP_CAPABILITY_REG,
-			       &capreg);
-		pd->dev_type = GETFIELD(PCICAP_EXP_CAP_TYPE, capreg);
-
-		/*
-		 * XXX We observe a problem on some PLX switches where one
-		 * of the downstream ports appears as an upstream port, we
-		 * fix that up here otherwise, other code will misbehave
-		 */
-		if (pd->parent && pd->dev_type == PCIE_TYPE_SWITCH_UPPORT &&
-		    pd->parent->dev_type == PCIE_TYPE_SWITCH_UPPORT &&
-		    vdid == 0x874810b5) {
-			PCIDBG(phb, bdfn,
-			       "Fixing up bad PLX downstream port !\n");
-			pd->dev_type = PCIE_TYPE_SWITCH_DNPORT;
-		}
-
-		/* XXX Handle ARI */
-		if (pd->dev_type == PCIE_TYPE_SWITCH_DNPORT ||
-		    pd->dev_type == PCIE_TYPE_ROOT_PORT)
-			pd->scan_map = 0x1;
-
-		/* Read MPS capability, whose maximal size is 4096 */
-		pci_cfg_read32(phb, bdfn, ecap + PCICAP_EXP_DEVCAP, &val);
-		pd->mps = (128 << GETFIELD(PCICAP_EXP_DEVCAP_MPSS, val));
-		if (pd->mps > 4096)
-			pd->mps = 4096;
-	} else {
-		pd->dev_type = PCIE_TYPE_LEGACY;
-	}
+	pci_init_capabilities(phb, pd);
 
 	/* If it's a bridge, sanitize the bus numbers to avoid forwarding
 	 *
@@ -331,11 +360,18 @@ static bool pci_enable_bridge(struct phb *phb, struct pci_device *pd)
 	uint16_t bctl;
 	bool was_reset = false;
 	int64_t ecap = 0;
+	uint32_t lcap = 0;
+	uint16_t lstat;
 
 	/* Disable master aborts, clear errors */
 	pci_cfg_read16(phb, pd->bdfn, PCI_CFG_BRCTL, &bctl);
 	bctl &= ~PCI_CFG_BRCTL_MABORT_REPORT;
 	pci_cfg_write16(phb, pd->bdfn, PCI_CFG_BRCTL, bctl);
+
+	if (pci_has_cap(pd, PCI_CFG_CAP_ID_EXP, false)) {
+		ecap = pci_cap(pd, PCI_CFG_CAP_ID_EXP, false);
+		pci_cfg_read32(phb, pd->bdfn, ecap+PCICAP_EXP_LCAP, &lcap);
+	}
 
 	/* PCI-E bridge, check the slot state. We don't do that on the
 	 * root complex as this is handled separately and not all our
@@ -345,7 +381,21 @@ static bool pci_enable_bridge(struct phb *phb, struct pci_device *pd)
 	    pd->dev_type == PCIE_TYPE_SWITCH_DNPORT) {
 		uint16_t slctl, slcap, slsta, lctl;
 
-		ecap = pci_cap(pd, PCI_CFG_CAP_ID_EXP, false);
+		/*
+		 * No need to touch the power supply if the PCIe link has
+		 * been up. Further more, the slot presence bit is lost while
+		 * the PCIe link is up on the specific PCI topology. In that
+		 * case, we need ignore the slot presence bit and go ahead for
+		 * probing. Otherwise, the NVMe adapter won't be probed.
+		 *
+		 * PHB3 root port, PLX switch 8748 (10b5:8748), PLX swich 9733
+		 * (10b5:9733), PMC 8546 swtich (11f8:8546), NVMe adapter
+		 * (1c58:0023).
+		 */
+		pci_cfg_read16(phb, pd->bdfn, ecap+PCICAP_EXP_LSTAT, &lstat);
+		if ((lcap & PCICAP_EXP_LCAP_DL_ACT_REP) &&
+		    (lstat & PCICAP_EXP_LSTAT_DLLL_ACT))
+			return true;
 
 		/* Read the slot status & check for presence detect */
 		pci_cfg_read16(phb, pd->bdfn, ecap+PCICAP_EXP_SLOTSTAT, &slsta);
@@ -401,11 +451,6 @@ static bool pci_enable_bridge(struct phb *phb, struct pci_device *pd)
 	/* PCI-E bridge, wait for link */
 	if (pd->dev_type == PCIE_TYPE_ROOT_PORT ||
 	    pd->dev_type == PCIE_TYPE_SWITCH_DNPORT) {
-		uint32_t lcap;
-
-		/* Read link caps */
-		pci_cfg_read32(phb, pd->bdfn, ecap+PCICAP_EXP_LCAP, &lcap);
-
 		/* Did link capability say we got reporting ?
 		 *
 		 * If yes, wait up to 10s, if not, wait 1s if we didn't already
@@ -480,6 +525,9 @@ void pci_remove_bus(struct phb *phb, struct list_head *list)
 
 	list_for_each_safe(list, pd, tmp, link) {
 		pci_remove_bus(phb, &pd->children);
+
+		if (phb->ops->device_remove)
+			phb->ops->device_remove(phb, pd);
 
 		/* Release device node and PCI slot */
 		if (pd->dn)
@@ -1402,6 +1450,8 @@ static void pci_add_one_device_node(struct phb *phb,
 	if (intpin)
 		dt_add_property_cells(np, "interrupts", intpin);
 
+	pci_handle_quirk(phb, pd, vdid & 0xffff, vdid >> 16);
+
 	/* XXX FIXME: Add a few missing ones such as
 	 *
 	 *  - devsel-speed (!express)
@@ -1497,10 +1547,10 @@ static void __pci_reset(struct list_head *list)
 void pci_reset(void)
 {
 	unsigned int i;
+	struct pci_slot *slot;
+	int64_t rc;
 
 	prlog(PR_NOTICE, "PCI: Clearing all devices...\n");
-
-	/* This is a remnant of fast-reboot, not currently used */
 
 	/* XXX Do those in parallel (at least the power up
 	 * state machine could be done in parallel)
@@ -1510,6 +1560,25 @@ void pci_reset(void)
 		if (!phb)
 			continue;
 		__pci_reset(&phb->devices);
+
+		slot = phb->slot;
+		if (!slot || !slot->ops.creset) {
+			PCINOTICE(phb, 0, "Can't do complete reset\n");
+		} else {
+			rc = slot->ops.creset(slot);
+			while (rc > 0) {
+				time_wait(rc);
+				rc = slot->ops.poll(slot);
+			}
+			if (rc < 0) {
+				PCIERR(phb, 0, "Complete reset failed, aborting"
+				               "fast reboot (rc=%lld)\n", rc);
+				if (platform.cec_reboot)
+					platform.cec_reboot();
+				while (true) {}
+			}
+		}
+
 		if (phb->ops->ioda_reset)
 			phb->ops->ioda_reset(phb, true);
 	}

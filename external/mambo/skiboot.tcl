@@ -18,9 +18,6 @@ mconfig stop_on_ill MAMBO_STOP_ON_ILL false
 
 # Location of application binary to load
 mconfig boot_image SKIBOOT ../../skiboot.lid
-if { [info exists env(SKIBOOT)] } {
-    mconfig boot_image SKIBOOT env(SKIBOOT)
-}
 
 # Boot: Memory location to load boot_image, for binary or vmlinux
 mconfig boot_load MAMBO_BOOT_LOAD 0x30000000
@@ -201,6 +198,13 @@ set fake_nvram_node [mysim of addchild $reserved_memory "ibm,fake-nvram" ""]
 set reg [list $fake_nvram_start $fake_nvram_size ]
 mysim of addprop $fake_nvram_node array64 "reg" reg
 mysim of addprop $fake_nvram_node empty "name" "ibm,fake-nvram"
+
+# Allow P9 to use all idle states
+if { $default_config == "P9" } {
+    set opal_node [mysim of addchild $root_node "ibm,opal" ""]
+    set power_mgt_node [mysim of addchild $opal_node "power-mgt" ""]
+    mysim of addprop $power_mgt_node int "ibm,enabled-stop-levels" 0xffffffff
+}
 
 # Init CPUs
 set pir 0

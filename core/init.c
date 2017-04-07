@@ -49,6 +49,7 @@
 #include <libstb/container.h>
 
 enum proc_gen proc_gen;
+unsigned int pcie_max_link_speed;
 
 static uint64_t kernel_entry;
 static size_t kernel_size;
@@ -700,6 +701,20 @@ static void per_thread_sanity_checks(void)
 	assert(cpu->state != cpu_state_no_cpu);
 }
 
+static void pci_nvram_init(void)
+{
+	const char *nvram_speed;
+
+	pcie_max_link_speed = 0;
+
+	nvram_speed = nvram_query("pcie-max-link-speed");
+	if (nvram_speed) {
+		pcie_max_link_speed = atoi(nvram_speed);
+		prlog(PR_NOTICE, "PHB: NVRAM set max link speed to GEN%i\n",
+		      pcie_max_link_speed);
+	}
+}
+
 /* Called from head.S, thus no prototype. */
 void main_cpu_entry(const void *fdt);
 
@@ -890,8 +905,8 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 
         /*
 	 * Initialize the opal messaging before platform.init as we are
-	 *  getting request to queue occ load opal message when host services
-	 *  got load occ request from FSP
+	 * getting request to queue occ load opal message when host services
+	 * got load occ request from FSP
 	 */
         opal_init_msg();
 
@@ -917,6 +932,8 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 
 	op_display(OP_LOG, OP_MOD_INIT, 0x0002);
 
+	pci_nvram_init();
+
 	phb3_preload_vpd();
 	phb3_preload_capp_ucode();
 	start_preload_kernel();
@@ -935,6 +952,7 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 
 	/* Probe NPUs */
 	probe_npu();
+	probe_npu2();
 
 	/* Initialize PCI */
 	pci_init_slots();
@@ -953,6 +971,9 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 	 * the reserve maps in the DT so we shouldn't affect the memory
 	 * regions after that
 	 */
+
+	/* Create the LPC bus interrupt-map on P9 */
+	lpc_finalize_interrupts();
 
 	/* Add the list of interrupts going to OPAL */
 	add_opal_interrupts();

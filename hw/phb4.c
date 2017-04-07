@@ -662,30 +662,17 @@ static void phb4_check_device_quirks(struct phb *phb, struct pci_device *dev)
 static int phb4_device_init(struct phb *phb, struct pci_device *dev,
 			    void *data __unused)
 {
-	int ecap = 0;
-	int aercap = 0;
+	int ecap, aercap;
 
 	/* Some special adapter tweaks for devices directly under the PHB */
 	if (dev->primary_bus == 1)
 		phb4_check_device_quirks(phb, dev);
 
-	/* Figure out PCIe & AER capability */
-	if (pci_has_cap(dev, PCI_CFG_CAP_ID_EXP, false)) {
-		ecap = pci_cap(dev, PCI_CFG_CAP_ID_EXP, false);
-
-		if (!pci_has_cap(dev, PCIECAP_ID_AER, true)) {
-			aercap = pci_find_ecap(phb, dev->bdfn,
-					       PCIECAP_ID_AER, NULL);
-			if (aercap > 0)
-				pci_set_cap(dev, PCIECAP_ID_AER, aercap, true);
-		} else {
-			aercap = pci_cap(dev, PCIECAP_ID_AER, true);
-		}
-	}
-
 	/* Common initialization for the device */
 	pci_device_init(phb, dev);
 
+	ecap = pci_cap(dev, PCI_CFG_CAP_ID_EXP, false);
+	aercap = pci_cap(dev, PCIECAP_ID_AER, true);
 	if (dev->dev_type == PCIE_TYPE_ROOT_PORT)
 		phb4_root_port_init(phb, dev, ecap, aercap);
 	else if (dev->dev_type == PCIE_TYPE_SWITCH_UPPORT ||
@@ -1343,7 +1330,7 @@ static int64_t phb4_map_pe_dma_window_real(struct phb *phb,
 		 * and end address bits 49:24 into TVE[54:55]||[24:47]
 		 * and set TVE[51]
 		 */
-		tve  = (pci_start_addr << 16) & (0xffffffull << 48);
+		tve  = (pci_start_addr << 16) & (0xffffffull << 40);
 		tve |= (pci_start_addr >> 38) & (3ull << 10);
 		tve |= (end >>  8) & (0xfffffful << 16);
 		tve |= (end >> 40) & (3ull << 8);
@@ -2384,6 +2371,7 @@ static const struct phb_ops phb4_ops = {
 	.choose_bus		= phb4_choose_bus,
 	.get_reserved_pe_number	= phb4_get_reserved_pe_number,
 	.device_init		= phb4_device_init,
+	.device_remove		= NULL,
 	.ioda_reset		= phb4_ioda_reset,
 	.papr_errinjct_reset	= phb4_papr_errinjct_reset,
 	.pci_reinit		= phb4_pci_reinit,
@@ -2525,13 +2513,16 @@ static bool phb4_init_rc_cfg(struct phb4 *p)
 	 *
 	 * AER inits
 	 */
-	aercap = pci_find_ecap(&p->phb, 0, PCIECAP_ID_AER, NULL);
-	if (aercap < 0) {
-		/* Shouldn't happen */
-		PHBERR(p, "Failed to locate AER Ecapability in bridge\n");
-		return false;
+	if (p->aercap <= 0) {
+		aercap = pci_find_ecap(&p->phb, 0, PCIECAP_ID_AER, NULL);
+		if (aercap < 0) {
+			PHBERR(p, "Can't locate AER capability\n");
+			return false;
+		}
+		p->aercap = aercap;
+	} else {
+		aercap = p->aercap;
 	}
-	p->aercap = aercap;
 
 	/* Clear all UE status */
 	phb4_pcicfg_write32(&p->phb, 0, aercap + PCIECAP_AER_UE_STATUS,
@@ -3047,8 +3038,6 @@ static int64_t phb4_dd1_lsi_set_xive(struct irq_source *is, uint32_t isn,
 	struct phb4 *p = is->data;
 	uint32_t idx = isn - p->base_lsi;
 
-	PHBERR(p, "DD1 LSI set_xive idx %d prio=%d\n", idx, priority);
-
 	if (idx > 8)
 		return OPAL_PARAMETER;
 
@@ -3058,16 +3047,17 @@ static int64_t phb4_dd1_lsi_set_xive(struct irq_source *is, uint32_t isn,
 
 	/* Mask using P=0,Q=1, unmask using P=1,Q=0 followed by EOI */
 	/* XXX FIXME: A quick mask/umask can make us shoot an interrupt
-	 * more than once to a queue. We need to keep track better
+	 * more than once to a queue. We need to keep track better.
+	 *
+	 * Thankfully, this is only on DD1 and for LSIs, so will go away
+	 * soon enough.
 	 */
-	PHBERR(p, " LIST before: %016llx\n", in_be64(p->regs + PHB_IODA_DATA0));
 	if (priority == 0xff)
 		out_be64(p->regs + PHB_IODA_DATA0, IODA3_LIST_Q);
 	else {
 		out_be64(p->regs + PHB_IODA_DATA0, IODA3_LIST_P);
 		__irq_source_eoi(is, isn);
 	}
-	PHBERR(p, " LIST after: %016llx\n", in_be64(p->regs + PHB_IODA_DATA0));
 
 	phb_unlock(&p->phb);
 
@@ -3106,7 +3096,6 @@ static void phb4_create(struct dt_node *np)
 	p->phb.ops = &phb4_ops;
 	p->phb.phb_type = phb_type_pcie_v4;
 	p->phb.scan_map = 0x1; /* Only device 0 to scan */
-	p->max_link_speed = dt_prop_get_u32_def(np, "ibm,max-link-speed", 4);
 	p->state = PHB4_STATE_UNINITIALIZED;
 
 	if (!phb4_calculate_windows(p))
@@ -3182,6 +3171,18 @@ static void phb4_create(struct dt_node *np)
 	/* Obtain informatin about the PHB from the hardware directly */
 	if (!phb4_read_capabilities(p))
 		goto failed;
+
+	/* Priority order: NVRAM -> dt -> GEN2 dd1 -> GEN4 */
+	p->max_link_speed = 4;
+	if (p->rev == PHB4_REV_NIMBUS_DD10)
+		p->max_link_speed = 2;
+	if (dt_has_node_property(np, "ibm,max-link-speed", NULL))
+		p->max_link_speed = dt_prop_get_u32(np, "ibm,max-link-speed");
+	if (pcie_max_link_speed)
+		p->max_link_speed = pcie_max_link_speed;
+	if (p->max_link_speed > 4) /* clamp to 4 */
+		p->max_link_speed = 4;
+	PHBINF(p, "Max link speed: GEN%i\n", p->max_link_speed);
 
 	/* Check for lane equalization values from HB or HDAT */
 	p->lane_eq = dt_prop_get_def_size(np, "ibm,lane-eq", NULL, &lane_eq_len);
@@ -3309,8 +3310,12 @@ static void phb4_probe_stack(struct dt_node *stk_node, uint32_t pec_index,
 	      gcid, pec_index, stk_index, path);
 	free(path);
 
+#if 0
 	force_assign = dt_has_node_property(stk_node,
 					    "force-assign-bars", NULL);
+#else
+	force_assign=1;
+#endif
 
 	pci_stack = pci_base + 0x40 * (stk_index + 1);
 	nest_stack = nest_base + 0x40 * (stk_index + 1);
@@ -3456,8 +3461,10 @@ static void phb4_probe_stack(struct dt_node *stk_node, uint32_t pec_index,
 		capp_ucode_base = dt_prop_get_u32(stk_node, "ibm,capp-ucode");
 		dt_add_property_cells(np, "ibm,capp-ucode", capp_ucode_base);
 	}
-	max_link_speed = dt_prop_get_u32_def(stk_node, "ibm,max-link-speed", 4);
-	dt_add_property_cells(np, "ibm,max-link-speed", max_link_speed);
+	if (dt_has_node_property(stk_node, "ibm,max-link-speed", NULL)) {
+		max_link_speed = dt_prop_get_u32(stk_node, "ibm,max-link-speed");
+		dt_add_property_cells(np, "ibm,max-link-speed", max_link_speed);
+	}
 	dt_add_property_cells(np, "ibm,capi-flags",
 			      OPAL_PHB_CAPI_FLAG_SNOOP_CONTROL);
 

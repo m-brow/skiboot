@@ -47,6 +47,11 @@ static void phb3_init_hw(struct phb3 *p, bool first_init);
 #define PHBERR(p, fmt, a...)	prlog(PR_ERR, "PHB#%04x: " fmt, \
 				      (p)->phb.opal_id, ## a)
 
+#define PE_CAPP_EN 0x9013c03
+
+#define PE_REG_OFFSET(p) \
+	((PHB3_IS_NAPLES(p) && (p)->index) ? 0x40 : 0x0)
+
 /* Helper to select an IODA table entry */
 static inline void phb3_ioda_sel(struct phb3 *p, uint32_t table,
 				 uint32_t addr, bool autoinc)
@@ -318,9 +323,6 @@ static int64_t phb3_pcicfg_write##size(struct phb *phb, uint32_t bdfn,	\
 		return OPAL_HARDWARE;					\
 	}								\
 									\
-	phb3_pcicfg_filter(phb, bdfn, offset, sizeof(type),             \
-			   (uint32_t *)&data, true);			\
-									\
 	addr = PHB_CA_ENABLE;						\
 	addr = SETFIELD(PHB_CA_BDFN, addr, bdfn);			\
 	addr = SETFIELD(PHB_CA_REG, addr, offset);			\
@@ -336,6 +338,9 @@ static int64_t phb3_pcicfg_write##size(struct phb *phb, uint32_t bdfn,	\
 		out_le##size(p->regs + PHB_CONFIG_DATA +		\
 			     (offset & (4 - sizeof(type))), data);	\
 	}								\
+									\
+	phb3_pcicfg_filter(phb, bdfn, offset, sizeof(type),             \
+			   (uint32_t *)&data, true);			\
 									\
         return OPAL_SUCCESS;						\
 }
@@ -360,6 +365,26 @@ static uint8_t phb3_choose_bus(struct phb *phb __unused,
 static int64_t phb3_get_reserved_pe_number(struct phb *phb __unused)
 {
 	return PHB3_RESERVED_PE_NUM;
+}
+
+static inline void phb3_enable_ecrc(struct phb *phb, bool enable)
+{
+	struct phb3 *p = phb_to_phb3(phb);
+	uint32_t ctl;
+
+	if (p->aercap <= 0)
+		return;
+
+	pci_cfg_read32(phb, 0, p->aercap + PCIECAP_AER_CAPCTL, &ctl);
+	if (enable) {
+		ctl |= (PCIECAP_AER_CAPCTL_ECRCG_EN |
+			PCIECAP_AER_CAPCTL_ECRCC_EN);
+	} else {
+		ctl &= ~(PCIECAP_AER_CAPCTL_ECRCG_EN |
+			 PCIECAP_AER_CAPCTL_ECRCC_EN);
+	}
+
+	pci_cfg_write32(phb, 0, p->aercap + PCIECAP_AER_CAPCTL, ctl);
 }
 
 static void phb3_root_port_init(struct phb *phb, struct pci_device *dev,
@@ -431,10 +456,7 @@ static void phb3_root_port_init(struct phb *phb, struct pci_device *dev,
 	pci_cfg_write32(phb, bdfn, aercap + PCIECAP_AER_CE_MASK, val32);
 
 	/* Enable ECRC check */
-	pci_cfg_read32(phb, bdfn, aercap + PCIECAP_AER_CAPCTL, &val32);
-	val32 |= (PCIECAP_AER_CAPCTL_ECRCG_EN |
-		  PCIECAP_AER_CAPCTL_ECRCC_EN);
-	pci_cfg_write32(phb, bdfn, aercap + PCIECAP_AER_CAPCTL, val32);
+	phb3_enable_ecrc(phb, true);
 
 	/* Enable all error reporting */
 	pci_cfg_read32(phb, bdfn, aercap + PCIECAP_AER_RERR_CMD, &val32);
@@ -522,24 +544,6 @@ static void phb3_switch_port_init(struct phb *phb,
 	pci_cfg_write32(phb, bdfn, aercap + PCIECAP_AER_CAPCTL, val32);
 }
 
-static inline bool phb3_endpoint_report_ecrc(struct pci_device *pd)
-{
-	if (!pd || !pd->parent)
-		return true;
-
-	/* No ECRC generation and check on Broadcom ethernet adapter
-	 * when it seats behind a PMC's PCIe switch downstream port.
-	 * Otherwise, the Broadcom ethernet adapter's config space
-	 * can't be accessed because of frozen PE error even after
-	 * the frozen PE error is cleared.
-	 */
-	if (pd->vdid == 0x168a14e4 || // Broadcom bnx2x CHIP_NUM_57800
-	    pd->parent->vdid == 0x854611f8)
-		return false;
-
-	return true;
-}
-
 static void phb3_endpoint_init(struct phb *phb,
 			       struct pci_device *dev,
 			       int ecap, int aercap)
@@ -577,12 +581,8 @@ static void phb3_endpoint_init(struct phb *phb,
 
 	/* Enable ECRC generation and check */
 	pci_cfg_read32(phb, bdfn, aercap + PCIECAP_AER_CAPCTL, &val32);
-	if (phb3_endpoint_report_ecrc(dev))
-		val32 |= (PCIECAP_AER_CAPCTL_ECRCG_EN |
-			  PCIECAP_AER_CAPCTL_ECRCC_EN);
-	else
-		val32 &= ~(PCIECAP_AER_CAPCTL_ECRCG_EN |
-			   PCIECAP_AER_CAPCTL_ECRCC_EN);
+	val32 |= (PCIECAP_AER_CAPCTL_ECRCG_EN |
+		  PCIECAP_AER_CAPCTL_ECRCC_EN);
 	pci_cfg_write32(phb, bdfn, aercap + PCIECAP_AER_CAPCTL, val32);
 }
 
@@ -641,33 +641,34 @@ static void phb3_check_device_quirks(struct phb *phb, struct pci_device *dev)
 	}
 }
 
+static inline int phb3_should_disable_ecrc(struct pci_device *pd)
+{
+	/*
+	 * When we have PMC PCIe switch, we need disable ECRC on root port.
+	 * Otherwise, the adapters behind the switch downstream ports might
+	 * not probed successfully.
+	 */
+	if (pd->vdid == 0x854611f8)
+		return true;
+
+	return false;
+}
+
 static int phb3_device_init(struct phb *phb,
 			    struct pci_device *dev,
-			    void *data __unused)
+			    void *data)
 {
-	int ecap = 0;
-	int aercap = 0;
+	struct phb3 *p = phb_to_phb3(phb);
+	int ecap, aercap;
 
 	/* Some special adapter tweaks for devices directly under the PHB */
 	phb3_check_device_quirks(phb, dev);
 
-	/* Figure out PCIe & AER capability */
-	if (pci_has_cap(dev, PCI_CFG_CAP_ID_EXP, false)) {
-		ecap = pci_cap(dev, PCI_CFG_CAP_ID_EXP, false);
-
-		if (!pci_has_cap(dev, PCIECAP_ID_AER, true)) {
-			aercap = pci_find_ecap(phb, dev->bdfn,
-					       PCIECAP_ID_AER, NULL);
-			if (aercap > 0)
-				pci_set_cap(dev, PCIECAP_ID_AER, aercap, true);
-		} else {
-			aercap = pci_cap(dev, PCIECAP_ID_AER, true);
-		}
-	}
-
 	/* Common initialization for the device */
 	pci_device_init(phb, dev);
 
+	ecap = pci_cap(dev, PCI_CFG_CAP_ID_EXP, false);
+	aercap = pci_cap(dev, PCIECAP_ID_AER, true);
 	if (dev->dev_type == PCIE_TYPE_ROOT_PORT)
 		phb3_root_port_init(phb, dev, ecap, aercap);
 	else if (dev->dev_type == PCIE_TYPE_SWITCH_UPPORT ||
@@ -676,7 +677,28 @@ static int phb3_device_init(struct phb *phb,
 	else
 		phb3_endpoint_init(phb, dev, ecap, aercap);
 
+	/*
+	 * Check if we need disable ECRC functionality on root port. It
+	 * only happens when PCI topology changes, meaning it's skipped
+	 * when reinitializing PCI device after EEH reset.
+	 */
+	if (!data && phb3_should_disable_ecrc(dev)) {
+		if (p->no_ecrc_devs++ == 0)
+			phb3_enable_ecrc(phb, false);
+	}
+
 	return 0;
+}
+
+static void phb3_device_remove(struct phb *phb, struct pci_device *pd)
+{
+	struct phb3 *p = phb_to_phb3(phb);
+
+	if (!phb3_should_disable_ecrc(pd) || p->no_ecrc_devs == 0)
+		return;
+
+	if (--p->no_ecrc_devs == 0)
+		phb3_enable_ecrc(phb, true);
 }
 
 static int64_t phb3_pci_reinit(struct phb *phb, uint64_t scope, uint64_t data)
@@ -692,7 +714,7 @@ static int64_t phb3_pci_reinit(struct phb *phb, uint64_t scope, uint64_t data)
 	if (!pd)
 		return OPAL_PARAMETER;
 
-	ret = phb3_device_init(phb, pd, NULL);
+	ret = phb3_device_init(phb, pd, pd);
 	if (ret)
 		return OPAL_HARDWARE;
 
@@ -2571,6 +2593,122 @@ static void do_capp_recovery_scoms(struct phb3 *p)
 	xscom_write(p->chip_id, CAPP_ERR_STATUS_CTRL + offset, reg);
 }
 
+/*
+ * Disable CAPI mode on a PHB.
+ *
+ * Must be done while PHB is fenced and in recovery. Leaves CAPP in recovery -
+ * we can't come out of recovery until the PHB has been reinitialised.
+ *
+ * We don't reset generic error registers here - we rely on phb3_init_hw() to
+ * do that.
+ *
+ * Sets PHB3_CAPP_DISABLING flag when complete.
+ */
+static void disable_capi_mode(struct phb3 *p)
+{
+	struct proc_chip *chip = get_chip(p->chip_id);
+	uint64_t reg;
+	uint32_t offset = PHB3_CAPP_REG_OFFSET(p);
+
+	lock(&capi_lock);
+
+	xscom_read(p->chip_id, PE_CAPP_EN + PE_REG_OFFSET(p), &reg);
+	if (!(reg & PPC_BIT(0))) {
+	        /* Not in CAPI mode, no action required */
+	        goto out;
+	}
+
+	PHBDBG(p, "CAPP: Disabling CAPI mode\n");
+	if (!(chip->capp_phb3_attached_mask & (1 << p->index)))
+		PHBERR(p, "CAPP: CAPP attached mask not set!\n");
+
+	xscom_read(p->chip_id, CAPP_ERR_STATUS_CTRL + offset, &reg);
+	if (!(reg & PPC_BIT(0))) {
+		PHBERR(p, "CAPP: not in recovery, can't disable CAPI mode!\n");
+		goto out;
+	}
+
+	/* Snoop CAPI Configuration Register - disable snooping */
+	xscom_write(p->chip_id, SNOOP_CAPI_CONFIG + offset, 0ull);
+
+	/* APC Master PB Control Register - disable examining cResps */
+	xscom_read(p->chip_id, APC_MASTER_PB_CTRL + offset, &reg);
+	reg &= ~PPC_BIT(3);
+	xscom_write(p->chip_id, APC_MASTER_PB_CTRL + offset, reg);
+
+	/* APC Master Config Register - de-select PHBs */
+	xscom_read(p->chip_id, APC_MASTER_CAPI_CTRL + offset, &reg);
+	reg &= ~PPC_BITMASK(1, 3);
+	xscom_write(p->chip_id, APC_MASTER_CAPI_CTRL + offset, reg);
+
+	/* PE Bus AIB Mode Bits */
+	xscom_read(p->chip_id, p->pci_xscom + 0xf, &reg);
+	reg |= PPC_BITMASK(7, 8);	/* Ch2 command credit */
+	reg &= ~PPC_BITMASK(40, 42);	/* Disable HOL blocking */
+	xscom_write(p->chip_id, p->pci_xscom + 0xf, reg);
+
+	/* PCI Hardware Configuration 0 Register - all store queues free */
+	xscom_read(p->chip_id, p->pe_xscom + 0x18, &reg);
+	reg &= ~PPC_BIT(14);
+	reg |= PPC_BIT(15);
+	xscom_write(p->chip_id, p->pe_xscom + 0x18, reg);
+
+	/*
+	 * PCI Hardware Configuration 1 Register - enable read response
+	 * arrival/address request ordering
+	 */
+	xscom_read(p->chip_id, p->pe_xscom + 0x19, &reg);
+	reg |= PPC_BITMASK(17,18);
+	xscom_write(p->chip_id, p->pe_xscom + 0x19, reg);
+
+	/*
+	 * AIB TX Command Credit Register - set AIB credit values back to
+	 * normal
+	 */
+	xscom_read(p->chip_id, p->pci_xscom + 0xd, &reg);
+	reg |= PPC_BIT(42);
+	reg &= ~PPC_BITMASK(43, 47);
+	xscom_write(p->chip_id, p->pci_xscom + 0xd, reg);
+
+	/* AIB TX Credit Init Timer - reset timer */
+	xscom_write(p->chip_id, p->pci_xscom + 0xc, 0xff00000000000000);
+
+	/*
+	 * PBCQ Mode Control Register - set dcache handling to normal, not CAPP
+	 * mode
+	 */
+	xscom_read(p->chip_id, p->pe_xscom + 0xb, &reg);
+	reg &= ~PPC_BIT(25);
+	xscom_write(p->chip_id, p->pe_xscom + 0xb, reg);
+
+	/* Registers touched by phb3_init_capp_regs() */
+
+	/* CAPP Transport Control Register */
+	xscom_write(p->chip_id, TRANSPORT_CONTROL + offset, 0x0001000000000000);
+
+	/* Canned pResp Map Register 0/1/2 */
+	xscom_write(p->chip_id, CANNED_PRESP_MAP0 + offset, 0);
+	xscom_write(p->chip_id, CANNED_PRESP_MAP1 + offset, 0);
+	xscom_write(p->chip_id, CANNED_PRESP_MAP2 + offset, 0);
+
+	/* Flush SUE State Map Register */
+	xscom_write(p->chip_id, FLUSH_SUE_STATE_MAP + offset, 0);
+
+	/* CAPP Epoch and Recovery Timers Control Register */
+	xscom_write(p->chip_id, CAPP_EPOCH_TIMER_CTRL + offset, 0);
+
+	/* PE Secure CAPP Enable Register - we're all done! Disable CAPP mode! */
+	xscom_write(p->chip_id, PE_CAPP_EN + PE_REG_OFFSET(p), 0ull);
+
+	/* Trigger CAPP recovery scoms after reinit */
+	p->flags |= PHB3_CAPP_DISABLING;
+
+	chip->capp_phb3_attached_mask &= ~(1 << p->index);
+
+out:
+	unlock(&capi_lock);
+}
+
 static int64_t phb3_creset(struct pci_slot *slot)
 {
 	struct phb3 *p = phb_to_phb3(slot->phb);
@@ -2601,6 +2739,10 @@ static int64_t phb3_creset(struct pci_slot *slot)
 		 */
 		if (!phb3_fenced(p))
 			xscom_write(p->chip_id, p->pe_xscom + 0x2, 0x000000f000000000ull);
+
+		/* Now that we're guaranteed to be fenced, disable CAPI mode */
+		if (!(p->flags & PHB3_CAPP_RECOVERY))
+			disable_capi_mode(p);
 
 		/* Clear errors in NFIR and raise ETU reset */
 		xscom_read(p->chip_id, p->pe_xscom + 0x0, &p->nfir_cache);
@@ -2640,6 +2782,11 @@ static int64_t phb3_creset(struct pci_slot *slot)
 		p->flags &= ~PHB3_AIB_FENCED;
 		p->flags &= ~PHB3_CAPP_RECOVERY;
 		phb3_init_hw(p, false);
+
+		if (p->flags & PHB3_CAPP_DISABLING) {
+			do_capp_recovery_scoms(p);
+			p->flags &= ~PHB3_CAPP_DISABLING;
+		}
 
 		pci_slot_set_state(slot, PHB3_SLOT_CRESET_FRESET);
 		return pci_slot_set_sm_timeout(slot, msecs_to_tb(100));
@@ -3459,11 +3606,11 @@ static void phb3_init_capp_errors(struct phb3 *p)
 	out_be64(p->regs + PHB_LEM_ERROR_MASK,		   0x40018e2400022482);
 }
 
-#define PE_CAPP_EN 0x9013c03
-
-#define PE_REG_OFFSET(p) \
-	((PHB3_IS_NAPLES(p) && (p)->index) ? 0x40 : 0x0)
-
+/*
+ * Enable CAPI mode on a PHB
+ *
+ * Changes to this init sequence may require updating disable_capi_mode().
+ */
 static int64_t enable_capi_mode(struct phb3 *p, uint64_t pe_number, bool dma_mode)
 {
 	uint64_t reg;
@@ -3634,6 +3781,7 @@ static int64_t phb3_set_capi_mode(struct phb *phb, uint64_t mode,
 
 	switch (mode) {
 	case OPAL_PHB_CAPI_MODE_PCIE:
+		/* Switching back to PCIe mode requires a creset */
 		return OPAL_UNSUPPORTED;
 
 	case OPAL_PHB_CAPI_MODE_CAPI:
@@ -3692,6 +3840,7 @@ static const struct phb_ops phb3_ops = {
 	.choose_bus		= phb3_choose_bus,
 	.get_reserved_pe_number	= phb3_get_reserved_pe_number,
 	.device_init		= phb3_device_init,
+	.device_remove		= phb3_device_remove,
 	.ioda_reset		= phb3_ioda_reset,
 	.papr_errinjct_reset	= phb3_papr_errinjct_reset,
 	.pci_reinit		= phb3_pci_reinit,
@@ -3938,13 +4087,16 @@ static bool phb3_init_rc_cfg(struct phb3 *p)
 	 *
 	 * AER inits
 	 */
-	aercap = pci_find_ecap(&p->phb, 0, PCIECAP_ID_AER, NULL);
-	if (aercap < 0) {
-		/* Shouldn't happen */
-		PHBERR(p, "Failed to locate AER Ecapability in bridge\n");
-		return false;
+	if (p->aercap <= 0) {
+		aercap = pci_find_ecap(&p->phb, 0, PCIECAP_ID_AER, NULL);
+		if (aercap < 0) {
+			PHBERR(p, "Can't locate AER capability\n");
+			return false;
+		}
+		p->aercap = aercap;
+	} else {
+		aercap = p->aercap;
 	}
-	p->aercap = aercap;
 
 	/* Clear all UE status */
 	phb3_pcicfg_write32(&p->phb, 0, aercap + PCIECAP_AER_UE_STATUS,
@@ -3971,10 +4123,10 @@ static bool phb3_init_rc_cfg(struct phb3 *p)
 	phb3_pcicfg_write32(&p->phb, 0, aercap + PCIECAP_AER_CE_MASK,
 			    PCIECAP_AER_CE_ADV_NONFATAL |
 			    (p->has_link ? 0 : PCIECAP_AER_CE_RECVR_ERR));
-	/* Enable ECRC generation & checking */
-	phb3_pcicfg_write32(&p->phb, 0, aercap + PCIECAP_AER_CAPCTL,
-			     PCIECAP_AER_CAPCTL_ECRCG_EN	|
-			     PCIECAP_AER_CAPCTL_ECRCC_EN);
+
+	/* Enable or disable ECRC generation & checking */
+	phb3_enable_ecrc(&p->phb, !p->no_ecrc_devs);
+
 	/* Enable reporting in root error control */
 	phb3_pcicfg_write32(&p->phb, 0, aercap + PCIECAP_AER_RERR_CMD,
 			     PCIECAP_AER_RERR_CMD_FE		|
@@ -4492,6 +4644,44 @@ static bool phb3_calculate_windows(struct phb3 *p)
 	return true;
 }
 
+/*
+ * Trigger a creset to disable CAPI mode on kernel shutdown.
+ *
+ * This helper is called repeatedly by the host sync notifier mechanism, which
+ * relies on the kernel to regularly poll the OPAL_SYNC_HOST_REBOOT call as it
+ * shuts down.
+ *
+ * This is a somewhat hacky abuse of the host sync notifier mechanism, but the
+ * alternatives require a new API call which won't work for older kernels.
+ */
+static bool phb3_host_sync_reset(void *data)
+{
+	struct phb3 *p = (struct phb3 *)data;
+	struct pci_slot *slot = p->phb.slot;
+	struct proc_chip *chip = get_chip(p->chip_id);
+	int64_t rc;
+
+	switch (slot->state) {
+	case PHB3_SLOT_NORMAL:
+		lock(&capi_lock);
+		rc = (chip->capp_phb3_attached_mask & (1 << p->index)) ?
+			OPAL_PHB_CAPI_MODE_CAPI :
+			OPAL_PHB_CAPI_MODE_PCIE;
+		unlock(&capi_lock);
+
+		if (rc == OPAL_PHB_CAPI_MODE_PCIE)
+			return true;
+
+		PHBINF(p, "PHB in CAPI mode, resetting\n");
+		p->flags &= ~PHB3_CAPP_RECOVERY;
+		phb3_creset(slot);
+		return false;
+	default:
+		rc = slot->ops.poll(slot);
+		return rc <= OPAL_SUCCESS;
+	}
+}
+
 static void phb3_create(struct dt_node *np)
 {
 	const struct dt_property *prop;
@@ -4515,7 +4705,6 @@ static void phb3_create(struct dt_node *np)
 	p->phb.ops = &phb3_ops;
 	p->phb.phb_type = phb_type_pcie_v3;
 	p->phb.scan_map = 0x1; /* Only device 0 to scan */
-	p->max_link_speed = dt_prop_get_u32_def(np, "ibm,max-link-speed", 3);
 	p->state = PHB3_STATE_UNINITIALIZED;
 
 	if (!phb3_calculate_windows(p))
@@ -4581,6 +4770,16 @@ static void phb3_create(struct dt_node *np)
 	if (!p->phb.base_loc_code)
 		PHBERR(p, "Base location code not found !\n");
 
+	/* Priority order: NVRAM -> dt -> GEN3 */
+	p->max_link_speed = 3;
+	if (dt_has_node_property(np, "ibm,max-link-speed", NULL))
+		p->max_link_speed = dt_prop_get_u32(np, "ibm,max-link-speed");
+	if (pcie_max_link_speed)
+		p->max_link_speed = pcie_max_link_speed;
+	if (p->max_link_speed > 3) /* clamp to 3 */
+		p->max_link_speed = 3;
+	PHBINF(p, "Max link speed: GEN%i\n", p->max_link_speed);
+
 	/* Check for lane equalization values from HB or HDAT */
 	p->lane_eq = dt_prop_get_def_size(np, "ibm,lane-eq", NULL, &lane_eq_len);
 	if (p->lane_eq && lane_eq_len != (8 * 4)) {
@@ -4624,6 +4823,8 @@ static void phb3_create(struct dt_node *np)
 
 	/* Load capp microcode into capp unit */
 	capp_load_ucode(p);
+
+	opal_add_host_sync_notifier(phb3_host_sync_reset, p);
 
 	/* Platform additional setup */
 	if (platform.pci_setup_phb)
@@ -4808,8 +5009,10 @@ static void phb3_probe_pbcq(struct dt_node *pbcq)
 		capp_ucode_base = dt_prop_get_u32(pbcq, "ibm,capp-ucode");
 		dt_add_property_cells(np, "ibm,capp-ucode", capp_ucode_base);
 	}
-	max_link_speed = dt_prop_get_u32_def(pbcq, "ibm,max-link-speed", 3);
-	dt_add_property_cells(np, "ibm,max-link-speed", max_link_speed);
+	if (dt_has_node_property(pbcq, "ibm,max-link-speed", NULL)) {
+		max_link_speed = dt_prop_get_u32(pbcq, "ibm,max-link-speed");
+		dt_add_property_cells(np, "ibm,max-link-speed", max_link_speed);
+	}
 	dt_add_property_cells(np, "ibm,capi-flags",
 			      OPAL_PHB_CAPI_FLAG_SNOOP_CONTROL);
 

@@ -132,6 +132,8 @@ enum proc_gen {
 };
 extern enum proc_gen proc_gen;
 
+extern unsigned int pcie_max_link_speed;
+
 /* Convert a 4-bit number to a hex char */
 extern char __attrconst tohex(uint8_t nibble);
 
@@ -215,7 +217,10 @@ extern void phb3_preload_vpd(void);
 extern int phb4_preload_capp_ucode(void);
 extern void phb4_preload_vpd(void);
 extern void probe_npu(void);
+extern void probe_npu2(void);
 extern void uart_init(void);
+extern void mbox_init(void);
+extern void early_uart_init(void);
 extern void homer_init(void);
 extern void occ_pstates_init(void);
 extern void slw_init(void);

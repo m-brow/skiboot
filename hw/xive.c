@@ -802,9 +802,9 @@ static void xive_init_default_vp(struct xive_vp *vp,
 	vp->w0 = VP_W0_VALID;
 }
 
-static void xive_init_default_eq(uint32_t vp_blk, uint32_t vp_idx,
-				 struct xive_eq *eq, void *backing_page,
-				 uint8_t prio)
+static void xive_init_emu_eq(uint32_t vp_blk, uint32_t vp_idx,
+			     struct xive_eq *eq, void *backing_page,
+			     uint8_t prio)
 {
 	memset(eq, 0, sizeof(struct xive_eq));
 
@@ -1692,6 +1692,7 @@ static bool xive_prealloc_tables(struct xive *x)
 	}
 	/* SBEs are initialized to 0b01 which corresponds to "ints off" */
 	memset(x->sbe_base, 0x55, SBE_SIZE);
+	xive_dbg(x, "SBE at %p size 0x%x\n", x->sbe_base, IVT_SIZE);
 
 	/* EAS/IVT entries are 8 bytes */
 	x->ivt_base = local_alloc(x->chip_id, IVT_SIZE, IVT_SIZE);
@@ -1703,6 +1704,7 @@ static bool xive_prealloc_tables(struct xive *x)
 	 * when actually used
 	 */
 	memset(x->ivt_base, 0, IVT_SIZE);
+	xive_dbg(x, "IVT at %p size 0x%x\n", x->ivt_base, IVT_SIZE);
 
 #ifdef USE_INDIRECT
 	/* Indirect EQ table. (XXX Align to 64K until I figure out the
@@ -1715,6 +1717,7 @@ static bool xive_prealloc_tables(struct xive *x)
 		return false;
 	}
 	memset(x->eq_ind_base, 0, al);
+	xive_dbg(x, "EQi at %p size 0x%llx\n", x->eq_ind_base, al);
 	x->eq_ind_count = IND_EQ_TABLE_SIZE / 8;
 
 	/* Indirect VP table. (XXX Align to 64K until I figure out the
@@ -1726,6 +1729,7 @@ static bool xive_prealloc_tables(struct xive *x)
 		xive_err(x, "Failed to allocate VP indirect table\n");
 		return false;
 	}
+	xive_dbg(x, "VPi at %p size 0x%llx\n", x->vp_ind_base, al);
 	x->vp_ind_count = IND_VP_TABLE_SIZE / 8;
 	memset(x->vp_ind_base, 0, al);
 
@@ -1753,6 +1757,7 @@ static bool xive_prealloc_tables(struct xive *x)
 			xive_err(x, "Failed to allocate VP page\n");
 			return false;
 		}
+		xive_dbg(x, "VP%d at %p size 0x%x\n", i, page, 0x10000);
 		memset(page, 0, 0x10000);
 		x->vp_ind_base[i] = ((uint64_t)page) & VSD_ADDRESS_MASK;
 
@@ -1849,8 +1854,10 @@ static void xive_setup_forward_ports(struct xive *x, struct proc_chip *remote_ch
 
 	/* NVT/VPD points to the remote NVT MMIO sets */
 	if (!xive_set_vsd(x, VST_TSEL_VPDT, remote_id,
-			  base | (uint64_t)remote_xive->pc_base))
+			  base | ((uint64_t)remote_xive->pc_base) |
+			  SETFIELD(VSD_TSIZE, 0ull, ilog2(PC_BAR_SIZE) - 12)))
 		goto error;
+
 	return;
 
  error:
@@ -2325,13 +2332,114 @@ static void xive_update_irq_mask(struct xive_src *s, uint32_t idx, bool masked)
 	in_be64(mmio_base + offset);
 }
 
-static int64_t xive_source_set_xive(struct irq_source *is, uint32_t isn,
-				    uint16_t server, uint8_t prio)
+static int64_t xive_sync(struct xive *x)
+{
+	uint64_t r;
+	void *p;
+
+	lock(&x->lock);
+
+	/* Second 2K range of second page */
+	p = x->ic_base + (1 << x->ic_shift) + 0x800;
+
+	/* TODO: Make this more fine grained */
+	out_be64(p + (10 << 7), 0); /* Sync OS escalations */
+	out_be64(p + (11 << 7), 0); /* Sync Hyp escalations */
+	out_be64(p + (12 << 7), 0); /* Sync Redistribution */
+	out_be64(p + ( 8 << 7), 0); /* Sync IPI */
+	out_be64(p + ( 9 << 7), 0); /* Sync HW */
+
+#define SYNC_MASK                \
+	(VC_EQC_CONF_SYNC_IPI  | \
+	 VC_EQC_CONF_SYNC_HW   | \
+	 VC_EQC_CONF_SYNC_ESC1 | \
+	 VC_EQC_CONF_SYNC_ESC2 | \
+	 VC_EQC_CONF_SYNC_REDI)
+
+	/* XXX Add timeout */
+	for (;;) {
+		r = xive_regrx(x, VC_EQC_CONFIG);
+		if ((r & SYNC_MASK) == SYNC_MASK)
+			break;
+		cpu_relax();
+	}
+	xive_regw(x, VC_EQC_CONFIG, r & ~SYNC_MASK);
+
+	/* Workaround HW issue, read back before allowing a new sync */
+	xive_regr(x, VC_GLOBAL_CONFIG);
+
+	unlock(&x->lock);
+
+	return 0;
+}
+
+static int64_t __xive_set_irq_config(struct irq_source *is, uint32_t girq,
+				     uint64_t vp, uint8_t prio, uint32_t lirq,
+				     bool update_esb)
 {
 	struct xive_src *s = container_of(is, struct xive_src, is);
-	uint8_t old_prio;
+	uint32_t old_target, vp_blk;
+	u8 old_prio;
 	int64_t rc;
 
+	/* Grab existing target */
+	if (!xive_get_irq_targetting(girq, &old_target, &old_prio, NULL))
+		return OPAL_PARAMETER;
+
+	/* Let XIVE configure the EQ. We do the update without the
+	 * synchronous flag, thus a cache update failure will result
+	 * in us returning OPAL_BUSY
+	 */
+	rc = xive_set_irq_targetting(girq, vp, prio, lirq, false);
+	if (rc)
+		return rc;
+
+	/* Do we need to update the mask ? */
+	if (old_prio != prio && (old_prio == 0xff || prio == 0xff)) {
+		/* The source has special variants of masking/unmasking */
+		if (s->orig_ops && s->orig_ops->set_xive) {
+			/* We don't pass as server on source ops ! Targetting
+			 * is handled by the XIVE
+			 */
+			rc = s->orig_ops->set_xive(is, girq, 0, prio);
+		} else if (update_esb) {
+			/* Ensure it's enabled/disabled in the source
+			 * controller
+			 */
+			xive_update_irq_mask(s, girq - s->esb_base,
+					     prio == 0xff);
+		}
+	}
+
+	/*
+	 * Synchronize the source and old target XIVEs to ensure that
+	 * all pending interrupts to the old target have reached their
+	 * respective queue.
+	 *
+	 * WARNING: This assumes the VP and it's queues are on the same
+	 *          XIVE instance !
+	 */
+	xive_sync(s->xive);
+	if (xive_decode_vp(old_target, &vp_blk, NULL, NULL, NULL)) {
+		struct xive *x = xive_from_pc_blk(vp_blk);
+		if (x)
+			xive_sync(x);
+	}
+
+	return OPAL_SUCCESS;
+}
+
+static int64_t xive_set_irq_config(uint32_t girq, uint64_t vp, uint8_t prio,
+				   uint32_t lirq, bool update_esb)
+{
+	struct irq_source *is = irq_find_source(girq);
+
+	return __xive_set_irq_config(is, girq, vp, prio, lirq, update_esb);
+}
+
+static int64_t xive_source_set_xive(struct irq_source *is __unused,
+				    uint32_t isn, uint16_t server, uint8_t prio)
+{
 	/*
 	 * WARNING: There is an inherent race with the use of the
 	 * mask bit in the EAS/IVT. When masked, interrupts are "lost"
@@ -2350,25 +2458,8 @@ static int64_t xive_source_set_xive(struct irq_source *is, uint32_t isn,
 	/* Unmangle server */
 	server >>= 2;
 
-	/* Grab existing prio/mask */
-	if (!xive_get_irq_targetting(isn, NULL, &old_prio, NULL))
-		return OPAL_PARAMETER;
-
-	/* Let XIVE configure the EQ synchronously */
-	rc = xive_set_irq_targetting(isn, server, prio, isn, true);
-	if (rc)
-		return rc;
-
-	/* The source has special variants of masking/unmasking */
-	if (old_prio != prio && (old_prio == 0xff || prio == 0xff)) {
-		if (s->orig_ops && s->orig_ops->set_xive)
-			rc = s->orig_ops->set_xive(is, isn, server, prio);
-		else
-			/* Ensure it's enabled/disabled in the source controller */
-			xive_update_irq_mask(s, isn - s->esb_base,
-					     prio == 0xff);
-	}
-	return OPAL_SUCCESS;
+	/* Set logical irq to match isn */
+	return xive_set_irq_config(isn, server, prio, isn, true);
 }
 
 void __xive_source_eoi(struct irq_source *is, uint32_t isn)
@@ -2650,8 +2741,8 @@ static void xive_ipi_init(struct xive *x, struct cpu_thread *cpu)
 
 	assert(xs);
 
-	xive_source_set_xive(&x->ipis.is, xs->ipi_irq, cpu->pir << 2,
-			     XIVE_EMULATION_PRIO);
+	__xive_set_irq_config(&x->ipis.is, xs->ipi_irq, cpu->pir,
+			      XIVE_EMULATION_PRIO, xs->ipi_irq, true);
 }
 
 static void xive_ipi_eoi(struct xive *x, uint32_t idx)
@@ -2721,12 +2812,9 @@ void xive_cpu_callin(struct cpu_thread *cpu)
 	out_8(xs->tm_ring1 + TM_QW3_HV_PHYS + TM_WORD2, 0x80);
 
 	xive_cpu_dbg(cpu, "Initialized interrupt management area\n");
-
-	/* Now unmask the IPI */
-	xive_ipi_init(x, cpu);
 }
 
-static void xive_init_cpu_defaults(struct xive_cpu_state *xs)
+static void xive_setup_hw_for_emu(struct xive_cpu_state *xs)
 {
 	struct xive_eq eq;
 	struct xive_vp vp;
@@ -2746,8 +2834,8 @@ static void xive_init_cpu_defaults(struct xive_cpu_state *xs)
 	assert(x_eq);
 
 	/* Initialize the structure */
-	xive_init_default_eq(xs->vp_blk, xs->vp_idx, &eq,
-			     xs->eq_page, XIVE_EMULATION_PRIO);
+	xive_init_emu_eq(xs->vp_blk, xs->vp_idx, &eq,
+			 xs->eq_page, XIVE_EMULATION_PRIO);
 
 	/* Use the cache watch to write it out */
 	xive_eqc_cache_update(x_eq, xs->eq_blk,
@@ -2760,6 +2848,78 @@ static void xive_init_cpu_defaults(struct xive_cpu_state *xs)
 	/* Use the cache watch to write it out */
 	xive_vpc_cache_update(x_vp, xs->vp_blk, xs->vp_idx,
 			      0, 8, &vp, false, true);
+}
+
+static void xive_init_cpu_emulation(struct xive_cpu_state *xs,
+				    struct cpu_thread *cpu)
+{
+	struct xive *x;
+
+	/* Setup HW EQ and VP */
+	xive_setup_hw_for_emu(xs);
+
+	/* Setup and unmask the IPI */
+	xive_ipi_init(xs->xive, cpu);
+
+	/* Initialize remaining state */
+	xs->cppr = 0;
+	xs->mfrr = 0xff;
+	xs->eqbuf = xive_get_eq_buf(xs->vp_blk,
+				    xs->eq_idx + XIVE_EMULATION_PRIO);
+	assert(xs->eqbuf);
+
+	xs->eqptr = 0;
+	xs->eqmsk = (0x10000/4) - 1;
+	xs->eqgen = 0;
+	x = xive_from_vc_blk(xs->eq_blk);
+	assert(x);
+	xs->eqmmio = x->eq_mmio + (xs->eq_idx + XIVE_EMULATION_PRIO) * 0x20000;
+}
+
+static void xive_init_cpu_exploitation(struct xive_cpu_state *xs)
+{
+	struct xive_vp vp;
+	struct xive *x_vp;
+
+	/* Grab the XIVE where the VP resides. It could be different from
+	 * the local chip XIVE if not using block group mode
+	 */
+	x_vp = xive_from_pc_blk(xs->vp_blk);
+	assert(x_vp);
+
+	/* Initialize/enable the VP */
+	xive_init_default_vp(&vp, xs->eq_blk, xs->eq_idx);
+
+	/* Use the cache watch to write it out */
+	xive_vpc_cache_update(x_vp, xs->vp_blk, xs->vp_idx,
+			      0, 8, &vp, false, true);
+
+	/* Clenaup remaining state */
+	xs->cppr = 0;
+	xs->mfrr = 0xff;
+	xs->eqbuf = NULL;
+	xs->eqptr = 0;
+	xs->eqmsk = 0;
+	xs->eqgen = 0;
+	xs->eqmmio = NULL;
+}
+
+static void xive_configure_ex_special_bar(struct xive *x, struct cpu_thread *c)
+{
+	uint64_t xa, val;
+	int64_t rc;
+
+	xive_cpu_dbg(c, "Setting up special BAR\n");
+	xa = XSCOM_ADDR_P9_EX(pir_to_core_id(c->pir), P9X_EX_NCU_SPEC_BAR);
+	val = (uint64_t)x->tm_base | P9X_EX_NCU_SPEC_BAR_ENABLE;
+	if (x->tm_shift == 16)
+		val |= P9X_EX_NCU_SPEC_BAR_256K;
+	xive_cpu_dbg(c, "NCU_SPEC_BAR_XA[%08llx]=%016llx\n", xa, val);
+	rc = xscom_write(c->chip_id, xa, val);
+	if (rc) {
+		xive_cpu_err(c, "Failed to setup NCU_SPEC_BAR\n");
+		/* XXXX  what do do now ? */
+	}
 }
 
 static void xive_provision_cpu(struct xive_cpu_state *xs, struct cpu_thread *c)
@@ -2795,43 +2955,6 @@ static void xive_provision_cpu(struct xive_cpu_state *xs, struct cpu_thread *c)
 		assert(false);
 	}
 	xs->eq_page = p;
-}
-
-static void xive_init_xics_emulation(struct xive_cpu_state *xs)
-{
-	struct xive *x;
-
-	xs->cppr = 0;
-	xs->mfrr = 0xff;
-
-	xs->eqbuf = xive_get_eq_buf(xs->vp_blk, xs->eq_idx + XIVE_EMULATION_PRIO);
-	assert(xs->eqbuf);
-
-	xs->eqptr = 0;
-	xs->eqmsk = (0x10000/4) - 1;
-	xs->eqgen = 0;
-
-	x = xive_from_vc_blk(xs->eq_blk);
-	assert(x);
-	xs->eqmmio = x->eq_mmio + (xs->eq_idx + XIVE_EMULATION_PRIO) * 0x20000;
-}
-
-static void xive_configure_ex_special_bar(struct xive *x, struct cpu_thread *c)
-{
-	uint64_t xa, val;
-	int64_t rc;
-
-	xive_cpu_dbg(c, "Setting up special BAR\n");
-	xa = XSCOM_ADDR_P9_EX(pir_to_core_id(c->pir), P9X_EX_NCU_SPEC_BAR);
-	val = (uint64_t)x->tm_base | P9X_EX_NCU_SPEC_BAR_ENABLE;
-	if (x->tm_shift == 16)
-		val |= P9X_EX_NCU_SPEC_BAR_256K;
-	printf("NCU_SPEC_BAR_XA[%08llx]=%016llx\n", xa, val);
-	rc = xscom_write(c->chip_id, xa, val);
-	if (rc) {
-		xive_cpu_err(c, "Failed to setup NCU_SPEC_BAR\n");
-		/* XXXX  what do do now ? */
-	}
 }
 
 static void xive_init_cpu(struct cpu_thread *c)
@@ -2873,11 +2996,8 @@ static void xive_init_cpu(struct cpu_thread *c)
 	/* Provision a VP and some EQDs for a physical CPU */
 	xive_provision_cpu(xs, c);
 
-	/* Configure the default EQ/VP */
-	xive_init_cpu_defaults(xs);
-
 	/* Initialize the XICS emulation related fields */
-	xive_init_xics_emulation(xs);
+	xive_init_cpu_emulation(xs, c);
 }
 
 static void xive_init_cpu_properties(struct cpu_thread *cpu)
@@ -3268,15 +3388,20 @@ static int64_t opal_xive_get_irq_info(uint32_t girq,
 		return OPAL_PARAMETER;
 	assert(is->ops == &xive_irq_source_ops);
 
-	*out_flags = xive_convert_irq_flags(s->flags);
+	if (out_flags)
+		*out_flags = xive_convert_irq_flags(s->flags);
 
 	/*
 	 * If the orig source has a set_xive callback, then set
 	 * OPAL_XIVE_IRQ_MASK_VIA_FW as masking/unmasking requires
-	 * source specific workarounds.
+	 * source specific workarounds. Same with EOI.
 	 */
-	if (out_flags && s->orig_ops && s->orig_ops->set_xive)
-		*out_flags |= OPAL_XIVE_IRQ_MASK_VIA_FW;
+	if (out_flags && s->orig_ops) {
+		if (s->orig_ops->set_xive)
+			*out_flags |= OPAL_XIVE_IRQ_MASK_VIA_FW;
+		if (s->orig_ops->eoi)
+			*out_flags |= OPAL_XIVE_IRQ_EOI_VIA_FW;
+	}
 
 	idx = girq - s->esb_base;
 
@@ -3288,12 +3413,10 @@ static int64_t opal_xive_get_irq_info(uint32_t girq,
 	if (s->flags & XIVE_SRC_EOI_PAGE1) {
 		uint64_t p1off = 1ull << (s->esb_shift - 1);
 		eoi_page = mm_base + p1off;
-		trig_page = mm_base;
-	} else {
-		eoi_page = mm_base;
-		if (!(s->flags & XIVE_SRC_STORE_EOI))
+		if (s->flags & XIVE_SRC_TRIGGER_PAGE)
 			trig_page = mm_base;
-	}
+	} else
+		eoi_page = mm_base;
 
 	if (out_eoi_page)
 		*out_eoi_page = eoi_page;
@@ -3327,33 +3450,23 @@ static int64_t opal_xive_set_irq_config(uint32_t girq,
 					uint8_t prio,
 					uint32_t lirq)
 {
-	struct irq_source *is = irq_find_source(girq);
-	struct xive_src *s = container_of(is, struct xive_src, is);
-	int64_t rc;
-
 	/*
-	 * WARNING: See comment in set_xive()
+	 * This variant is meant for a XIVE-aware OS, thus it will
+	 * *not* affect the ESB state of the interrupt. If used with
+	 * a prio of FF, the IVT/EAS will be mased. In that case the
+	 * races have to be handled by the OS.
+	 *
+	 * The exception to this rule is interrupts for which masking
+	 * and unmasking is handled by firmware. In that case the ESB
+	 * state isn't under OS control and will be dealt here. This
+	 * is currently only the case of LSIs and on P9 DD1.0 only so
+	 * isn't an issue.
 	 */
 
 	if (xive_mode != XIVE_MODE_EXPL)
 		return OPAL_WRONG_STATE;
 
-	/* Let XIVE configure the EQ. We do the update without the
-	 * synchronous flag, thus a cache update failure will result
-	 * in us returning OPAL_BUSY
-	 */
-	rc = xive_set_irq_targetting(girq, vp, prio, lirq, false);
-	if (rc)
-		return rc;
-
-	/* The source has special variants of masking/unmasking */
-	if (s->orig_ops && s->orig_ops->set_xive)
-		rc = s->orig_ops->set_xive(is, girq, vp >> 2, prio);
-	else
-		/* Ensure it's enabled/disabled in the source controller */
-		xive_update_irq_mask(s, girq - s->esb_base, prio == 0xff);
-
-	return OPAL_SUCCESS;
+	return xive_set_irq_config(girq, vp, prio, lirq, false);
 }
 
 static int64_t opal_xive_get_queue_info(uint64_t vp, uint32_t prio,
@@ -3447,7 +3560,8 @@ static int64_t opal_xive_set_queue_info(uint64_t vp, uint32_t prio,
 	if (!xive_decode_vp(vp, &vp_blk, &vp_idx, NULL, &group))
 		return OPAL_PARAMETER;
 
-	/* Make a local copy which we will later try to commit using
+	/*
+	 * Make a local copy which we will later try to commit using
 	 * the cache watch facility
 	 */
 	eq = *old_eq;
@@ -3487,16 +3601,22 @@ static int64_t opal_xive_set_queue_info(uint64_t vp, uint32_t prio,
 	if (qflags & OPAL_XIVE_EQ_ESCALATE)
 		eq.w0 |= EQ_W0_ESCALATE_CTL;
 
-	/* Check enable transition. On any transition we clear PQ,
-	 * set the generation bit, clear the offset and mask the
-	 * escalation interrupt
+	/* Unconditionally clear the current queue pointer, set
+	 * generation to 1 and disable escalation interrupts.
 	 */
-	if ((qflags & OPAL_XIVE_EQ_ENABLED) && !(eq.w0 & EQ_W0_VALID)) {
+	eq.w1 = EQ_W1_GENERATION |
+		(old_eq->w1 & (EQ_W1_ESe_P | EQ_W1_ESe_Q |
+			       EQ_W1_ESn_P | EQ_W1_ESn_Q));
+
+	/* Enable or disable. We always enable backlog for an
+	 * enabled queue otherwise escalations won't work.
+	 */
+	if (qflags & OPAL_XIVE_EQ_ENABLED)
 		eq.w0 |= EQ_W0_VALID | EQ_W0_BACKLOG;
-		eq.w1 = EQ_W1_GENERATION | EQ_W1_ESe_Q;
-	} else if (!(qflags & OPAL_XIVE_EQ_ENABLED)) {
+	else {
 		eq.w0 &= ~EQ_W0_VALID;
-		eq.w1 = EQ_W1_GENERATION | EQ_W1_ESe_Q;
+		eq.w1 &= ~(EQ_W1_ESe_P | EQ_W1_ESn_P);
+		eq.w1 |= EQ_W1_ESe_Q | EQ_W1_ESn_Q;
 	}
 
 	/* Update EQ, non-synchronous */
@@ -3627,7 +3747,7 @@ static void xive_cleanup_cpu_cam(struct cpu_thread *c)
 {
 	struct xive_cpu_state *xs = c->xstate;
 	struct xive *x = xs->xive;
-	void *ind_tm_base = x->ic_base + 4 * IC_PAGE_SIZE;
+	void *ind_tm_base = x->ic_base + (4 << x->ic_shift);
 
 	/* Setup indirect access to the corresponding thread */
 	xive_regw(x, PC_TCTXT_INDIR0,
@@ -3649,13 +3769,14 @@ static void xive_cleanup_cpu_cam(struct cpu_thread *c)
 static void xive_reset_one(struct xive *x)
 {
 	struct cpu_thread *c;
+	bool eq_firmware;
 	int i = 0;
 
 	/* Mask all interrupt sources */
 	while ((i = bitmap_find_one_bit(*x->int_enabled_map,
 					i, MAX_INT_ENTRIES - i)) >= 0) {
-		opal_xive_set_irq_config(x->int_base + i, 0, 0xff,
-					 x->int_base + i);
+		xive_set_irq_config(x->int_base + i, 0, 0xff,
+				    x->int_base + i, true);
 		i++;
 	}
 
@@ -3664,17 +3785,32 @@ static void xive_reset_one(struct xive *x)
 
 	/* Reset all allocated EQs and free the user ones */
 	bitmap_for_each_one(*x->eq_map, MAX_EQ_COUNT >> 3, i) {
-		struct xive_eq eq0 = {0};
+		struct xive_eq eq0;
 		struct xive_eq *eq;
+		int j;
 
 		if (i == 0)
 			continue;
-		eq = xive_get_eq(x, i);
-		if (!eq)
-			continue;
-		xive_eqc_cache_update(x, x->block_id,
-				      i, 0, 4, &eq0, false, true);
-		if (!(eq->w0 & EQ_W0_FIRMWARE))
+		eq_firmware = false;
+		memset(&eq0, 0, sizeof(eq0));
+		for (j = 0; j < 8; j++) {
+			uint32_t idx = (i << 3) | j;
+
+			eq = xive_get_eq(x, idx);
+			if (!eq)
+				continue;
+
+			/* We need to preserve the firmware bit, otherwise
+			 * we will incorrectly free the EQs that are reserved
+			 * for the physical CPUs
+			 */
+			eq0.w0 = eq->w0 & EQ_W0_FIRMWARE;
+			xive_eqc_cache_update(x, x->block_id,
+					      idx, 0, 4, &eq0, false, true);
+			if (eq->w0 & EQ_W0_FIRMWARE)
+				eq_firmware = true;
+		}
+		if (!eq_firmware)
 			bitmap_clr_bit(*x->eq_map, i);
 	}
 
@@ -3721,26 +3857,21 @@ static void xive_reset_one(struct xive *x)
 	buddy_reset(x->vp_buddy);
 #endif
 
-	/* Re-configure the CPUs */
+	/* The rest must not be called with the lock held */
+	unlock(&x->lock);
+
+	/* Re-configure VPs and emulation */
 	for_each_present_cpu(c) {
 		struct xive_cpu_state *xs = c->xstate;
 
 		if (c->chip_id != x->chip_id || !xs)
 			continue;
 
-		/* Setup default VP and EQ */
-		xive_init_cpu_defaults(xs);
-
-		/* Re-Initialize the XICS emulation related fields
-		 * and re-enable IPI
-		 */
-		if (xive_mode == XIVE_MODE_EMU) {
-			xive_init_xics_emulation(xs);
-			xive_ipi_init(x, c);
-		}
+		if (xive_mode == XIVE_MODE_EMU)
+			xive_init_cpu_emulation(xs, c);
+		else
+			xive_init_cpu_exploitation(xs);
 	}
-
-	unlock(&x->lock);
 }
 
 static int64_t opal_xive_reset(uint64_t version)
@@ -4001,9 +4132,179 @@ static int64_t opal_xive_free_irq(uint32_t girq)
 		return OPAL_PARAMETER;
 	}
 	bitmap_clr_bit(*x->ipi_alloc_map, idx);
+	bitmap_clr_bit(*x->int_enabled_map, idx);
 	unlock(&x->lock);
 
 	return OPAL_SUCCESS;
+}
+
+static int64_t opal_xive_dump_tm(uint32_t offset, const char *n, uint32_t pir)
+{
+	struct cpu_thread *c = find_cpu_by_pir(pir);
+	struct xive_cpu_state *xs;
+	struct xive *x;
+	void *ind_tm_base;
+	uint64_t v0,v1;
+
+	if (!c)
+		return OPAL_PARAMETER;
+	xs = c->xstate;
+	if (!xs || !xs->tm_ring1)
+		return OPAL_INTERNAL_ERROR;
+	x = xs->xive;
+	ind_tm_base = x->ic_base + (4 << x->ic_shift);
+
+	lock(&x->lock);
+
+	/* Setup indirect access to the corresponding thread */
+	xive_regw(x, PC_TCTXT_INDIR0,
+		  PC_TCTXT_INDIR_VALID |
+		  SETFIELD(PC_TCTXT_INDIR_THRDID, 0ull, pir & 0xff));
+
+	v0 = in_be64(ind_tm_base + offset);
+	v1 = in_be64(ind_tm_base + offset + 8);
+	prlog(PR_INFO, "CPU[%04x]: TM state for QW %s\n", pir, n);
+	prlog(PR_INFO, "CPU[%04x]: NSR CPPR IPB LSMFB ACK# INC AGE PIPR"
+	      " W2       W3\n", pir);
+	prlog(PR_INFO, "CPU[%04x]: %02x  %02x   %02x  %02x    %02x   "
+	       "%02x  %02x  %02x   %08x %08x\n", pir,
+	      (uint8_t)(v0 >> 58) & 0xff, (uint8_t)(v0 >> 48) & 0xff,
+	      (uint8_t)(v0 >> 40) & 0xff, (uint8_t)(v0 >> 32) & 0xff,
+	      (uint8_t)(v0 >> 24) & 0xff, (uint8_t)(v0 >> 16) & 0xff,
+	      (uint8_t)(v0 >>  8) & 0xff, (uint8_t)(v0      ) & 0xff,
+	      (uint32_t)(v1 >> 32) & 0xffffffff,
+	      (uint32_t)(v1 & 0xffffffff));
+
+
+	xive_regw(x, PC_TCTXT_INDIR0, 0);
+	unlock(&x->lock);
+
+	return OPAL_SUCCESS;
+}
+
+static int64_t opal_xive_dump_vp(uint32_t vp_id)
+{
+	uint32_t blk, idx;
+	uint8_t order;
+	bool group;
+	struct xive *x;
+	struct xive_vp *vp;
+	uint32_t *vpw;
+
+	if (!xive_decode_vp(vp_id, &blk, &idx, &order, &group))
+		return OPAL_PARAMETER;
+
+	x = xive_from_vc_blk(blk);
+	if (!x)
+		return OPAL_PARAMETER;
+	vp = xive_get_vp(x, idx);
+	if (!vp)
+		return OPAL_PARAMETER;
+	lock(&x->lock);
+
+	xive_vpc_scrub_clean(x, blk, idx);
+
+	vpw = ((uint32_t *)vp) + (group ? 8 : 0);
+	prlog(PR_INFO, "VP[%08x]: 0..3: %08x %08x %08x %08x\n", vp_id,
+	      vpw[0], vpw[1], vpw[2], vpw[3]);
+	prlog(PR_INFO, "VP[%08x]: 4..7: %08x %08x %08x %08x\n", vp_id,
+	      vpw[4], vpw[5], vpw[6], vpw[7]);
+	unlock(&x->lock);
+
+	return OPAL_SUCCESS;
+}
+
+static int64_t opal_xive_dump_emu(uint32_t pir)
+{
+	struct cpu_thread *c = find_cpu_by_pir(pir);
+	struct xive_cpu_state *xs;
+
+	if (!c)
+		return OPAL_PARAMETER;
+
+	prlog(PR_INFO, "CPU[%04x]: XIVE emulation state\n", pir);
+
+	xs = c->xstate;
+	if (!xs) {
+		prlog(PR_INFO, "  <none>\n");
+		return OPAL_SUCCESS;
+	}
+	lock(&xs->lock);
+
+	prlog(PR_INFO, "CPU[%04x]: cppr=%02x mfrr=%02x pend=%02x"
+	      " prev_cppr=%02x\n", pir,
+	      xs->cppr, xs->mfrr, xs->pending, xs->prev_cppr);
+
+	prlog(PR_INFO, "CPU[%04x]: EQ IDX=%x MSK=%x G=%d [%08x %08x ...]\n",
+	      pir,  xs->eqptr, xs->eqmsk, xs->eqgen,
+	      xs->eqbuf[(xs->eqptr + 0) & xs->eqmsk],
+	      xs->eqbuf[(xs->eqptr + 1) & xs->eqmsk]);
+
+	unlock(&xs->lock);
+
+	return OPAL_SUCCESS;
+}
+
+static int64_t opal_xive_sync_irq_src(uint32_t girq)
+{
+	struct xive *x = xive_from_isn(girq);
+
+	if (!x)
+		return OPAL_PARAMETER;
+	return xive_sync(x);
+}
+
+static int64_t opal_xive_sync_irq_target(uint32_t girq)
+{
+	uint32_t target, vp_blk;
+	struct xive *x;
+
+	if (!xive_get_irq_targetting(girq, &target, NULL, NULL))
+		return OPAL_PARAMETER;
+	if (!xive_decode_vp(target, &vp_blk, NULL, NULL, NULL))
+		return OPAL_PARAMETER;
+	x = xive_from_pc_blk(vp_blk);
+	if (!x)
+		return OPAL_PARAMETER;
+	return xive_sync(x);
+}
+
+static int64_t opal_xive_sync(uint32_t type, uint32_t id)
+{
+	int64_t rc = OPAL_SUCCESS;;
+
+	if (type & XIVE_SYNC_EAS)
+		rc = opal_xive_sync_irq_src(id);
+	if (rc)
+		return rc;
+	if (type & XIVE_SYNC_QUEUE)
+		rc = opal_xive_sync_irq_target(id);
+	if (rc)
+		return rc;
+
+	/* Add more ... */
+
+	return rc;
+}
+
+static int64_t opal_xive_dump(uint32_t type, uint32_t id)
+{
+	switch (type) {
+	case XIVE_DUMP_TM_HYP:
+		return opal_xive_dump_tm(TM_QW3_HV_PHYS, "PHYS", id);
+	case XIVE_DUMP_TM_POOL:
+		return opal_xive_dump_tm(TM_QW2_HV_POOL, "POOL", id);
+	case XIVE_DUMP_TM_OS:
+		return opal_xive_dump_tm(TM_QW1_OS, "OS  ", id);
+	case XIVE_DUMP_TM_USER:
+		return opal_xive_dump_tm(TM_QW0_USER, "USER", id);
+	case XIVE_DUMP_VP:
+		return opal_xive_dump_vp(id);
+	case XIVE_DUMP_EMU_STATE:
+		return opal_xive_dump_emu(id);
+	default:
+		return OPAL_PARAMETER;
+	}
 }
 
 static void xive_init_globals(void)
@@ -4086,5 +4387,7 @@ void init_xive(void)
 	opal_register(OPAL_XIVE_FREE_VP_BLOCK, opal_xive_free_vp_block, 1);
 	opal_register(OPAL_XIVE_GET_VP_INFO, opal_xive_get_vp_info, 5);
 	opal_register(OPAL_XIVE_SET_VP_INFO, opal_xive_set_vp_info, 3);
+	opal_register(OPAL_XIVE_SYNC, opal_xive_sync, 2);
+	opal_register(OPAL_XIVE_DUMP, opal_xive_dump, 2);
 }
 

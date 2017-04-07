@@ -143,6 +143,12 @@
 #define XSCOM_ADDR_P9_EC_SLAVE(core, addr) \
 	XSCOM_ADDR_P9_EC(core, (addr) | 0xf0000)
 
+/* Power 9 EC slave per-core power mgt slave registers */
+#define EC_PPM_SPECIAL_WKUP_OTR		0x010A
+#define EC_PPM_SPECIAL_WKUP_FSP		0x010B
+#define EC_PPM_SPECIAL_WKUP_OCC		0x010C
+#define EC_PPM_SPECIAL_WKUP_HYP		0x010D
+
 /************* XXXX Move these P8 only registers elswhere !!! ****************/
 
 /* Per core power mgt registers */
@@ -192,6 +198,7 @@
 #define XSCOM_DATA_IND_COMPLETE		PPC_BIT(32)
 #define XSCOM_DATA_IND_ERR		PPC_BITMASK(33,35)
 #define XSCOM_DATA_IND_DATA		PPC_BITMASK(48,63)
+#define XSCOM_DATA_IND_FORM1_DATA	PPC_BITMASK(12,63)
 
 /* HB folks say: try 10 time for now */
 #define XSCOM_IND_MAX_RETRIES		10

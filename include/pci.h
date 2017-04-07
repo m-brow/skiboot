@@ -74,7 +74,10 @@ struct pci_device {
 	uint32_t		sub_vdid;
 	uint32_t		class;
 	uint64_t		cap_list;
-	uint32_t		cap[64];
+	struct {
+		uint32_t	pos;
+		void		*data;
+	} cap[64];
 	uint32_t		mps;		/* Max payload size capability */
 
 	uint32_t		pcrf_start;
@@ -88,15 +91,17 @@ struct pci_device {
 	struct list_node	link;
 };
 
-static inline void pci_set_cap(struct pci_device *pd,
-			       int id, int pos, bool ext)
+static inline void pci_set_cap(struct pci_device *pd, int id,
+			       int pos, void *data, bool ext)
 {
 	if (!ext) {
 		pd->cap_list |= (0x1ul << id);
-		pd->cap[id] = pos;
+		pd->cap[id].pos = pos;
+		pd->cap[id].data = data;
 	} else {
 		pd->cap_list |= (0x1ul << (id + 32));
-		pd->cap[id + 32] = pos;
+		pd->cap[id + 32].pos = pos;
+		pd->cap[id + 32].data = data;
 	}
 }
 
@@ -113,9 +118,17 @@ static inline int pci_cap(struct pci_device *pd,
 			  int id, bool ext)
 {
 	if (!ext)
-		return pd->cap[id];
+		return pd->cap[id].pos;
 	else
-		return pd->cap[id + 32];
+		return pd->cap[id + 32].pos;
+}
+
+static inline void *pci_cap_data(struct pci_device *pd, int id, bool ext)
+{
+	if (!ext)
+		return pd->cap[id].data;
+	else
+		return pd->cap[id + 32].data;
 }
 
 /*
@@ -194,6 +207,7 @@ struct phb_ops {
 	 */
 	int (*device_init)(struct phb *phb, struct pci_device *device,
 			   void *data);
+	void (*device_remove)(struct phb *phb, struct pci_device *pd);
 
 	/* PHB final fixup is called after PCI probing is completed */
 	void (*phb_final_fixup)(struct phb *phb);
@@ -315,6 +329,7 @@ enum phb_type {
 	phb_type_pcie_v2,
 	phb_type_pcie_v3,
 	phb_type_pcie_v4,
+	phb_type_npu_v2,
 };
 
 struct phb {
@@ -399,6 +414,7 @@ extern void pci_add_device_nodes(struct phb *phb,
 extern int64_t pci_find_cap(struct phb *phb, uint16_t bdfn, uint8_t cap);
 extern int64_t pci_find_ecap(struct phb *phb, uint16_t bdfn, uint16_t cap,
 			     uint8_t *version);
+extern void pci_init_capabilities(struct phb *phb, struct pci_device *pd);
 extern void pci_device_init(struct phb *phb, struct pci_device *pd);
 extern struct pci_device *pci_walk_dev(struct phb *phb,
 				       struct pci_device *pd,

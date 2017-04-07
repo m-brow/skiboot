@@ -264,8 +264,10 @@ static void add_uart(const struct spss_iopath *iopath, struct dt_node *lpc)
 		be32_to_cpu(iopath->lpc.uart_baud));
 	dt_add_property_cells(serial, "clock-frequency",
 		be32_to_cpu(iopath->lpc.uart_clk));
-	dt_add_property_cells(serial, "serirq-interrupt",
+	dt_add_property_cells(serial, "interrupts",
 		be32_to_cpu(iopath->lpc.uart_int_number));
+	dt_add_property_string(serial, "device_type", "serial");
+
 
 	prlog(PR_DEBUG, "LPC UART: base addr = %#" PRIx64" (%#" PRIx64 ") size = %#x clk = %u, baud = %u\n",
 		be64_to_cpu(iopath->lpc.uart_base),
@@ -277,11 +279,26 @@ static void add_uart(const struct spss_iopath *iopath, struct dt_node *lpc)
 
 static void bmc_create_node(const struct HDIF_common_hdr *sp)
 {
+	struct dt_node *bmc_node;
 	u32 fw_bar, io_bar, mem_bar, internal_bar;
 	const struct spss_iopath *iopath;
+	const struct spss_sp_impl *sp_impl;
 	struct dt_node *lpcm, *lpc, *n;
 	u64 lpcm_base, lpcm_end;
-	int chip_id;
+	int chip_id, size;
+
+	bmc_node = dt_new(dt_root, "bmc");
+	assert(bmc_node);
+
+	dt_add_property_cells(bmc_node, "#address-cells", 1);
+	dt_add_property_cells(bmc_node, "#size-cells", 0);
+
+	/* TODO: add sensor info under /bmc */
+	sp_impl = HDIF_get_idata(sp, SPSS_IDATA_SP_IMPL, &size);
+	if (CHECK_SPPTR(sp_impl) && (size > 8)) {
+		dt_add_property_strings(bmc_node, "compatible", sp_impl->sp_family);
+		prlog(PR_INFO, "SP Family is %s\n", sp_impl->sp_family);
+	}
 
 	iopath = HDIF_get_iarray_item(sp, SPSS_IDATA_SP_IOPATH, 0, NULL);
 
@@ -383,6 +400,32 @@ static void bmc_create_node(const struct HDIF_common_hdr *sp)
 	);
 }
 
+/*
+ * Search for and instanciate BMC nodes. This is mostly the same as fsp_parse()
+ * below, but it can be called earlier since BMCs don't depend on the psihb
+ * nodes being added.
+ */
+void bmc_parse(void)
+{
+	bool found = false;
+	const void *sp;
+	int i;
+
+	sp = get_hdif(&spira.ntuples.sp_subsys, SPSS_HDIF_SIG);
+	if (!sp)
+		return;
+
+	for_each_ntuple_idx(&spira.ntuples.sp_subsys, sp, i, SPSS_HDIF_SIG) {
+		if (find_service_proc_type(sp, i) == SP_BMC) {
+			bmc_create_node(sp);
+			found = true;
+		}
+	}
+
+	if (found)
+		early_uart_init();
+}
+
 void fsp_parse(void)
 {
 	struct dt_node *fsp_root = NULL, *fsp_node;
@@ -416,7 +459,7 @@ void fsp_parse(void)
 			break;
 
 		case SP_BMC:
-			bmc_create_node(sp);
+			/* Handled above */
 			break;
 
 		case SP_BAD:

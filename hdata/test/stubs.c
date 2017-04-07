@@ -38,7 +38,7 @@ void _prlog(int log_level __attribute__((unused)), const char* fmt, ...)
 
         va_start(ap, fmt);
         if (log_level < 7)
-		vprintf(fmt, ap);
+		vfprintf(stderr, fmt, ap);
         va_end(ap);
 }
 
@@ -100,3 +100,5 @@ STUB(fsp_preload_lid);
 STUB(fsp_wait_lid_loaded);
 STUB(fsp_adjust_lid_side);
 STUB(mem_reserve_hw);
+STUB(early_uart_init);
+STUB(backtrace);

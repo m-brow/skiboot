@@ -95,22 +95,34 @@ static uint64_t xscom_wait_done(void)
 static void xscom_reset(uint32_t gcid)
 {
 	u64 hmer;
+	uint32_t recv_status_reg, log_reg, err_reg;
 
 	/* Clear errors in HMER */
 	mtspr(SPR_HMER, HMER_CLR_MASK);
 
+	/* Setup local and target scom addresses */
+	if (proc_gen == proc_gen_p9) {
+		recv_status_reg = 0x00090018;
+		log_reg = 0x0090012;
+		err_reg = 0x0090013;
+	} else {
+		recv_status_reg = 0x202000f;
+		log_reg = 0x2020007;
+		err_reg = 0x2020009;
+	}
+
 	/* First we need to write 0 to a register on our chip */
-	out_be64(xscom_addr(this_cpu()->chip_id, 0x202000f), 0);
+	out_be64(xscom_addr(this_cpu()->chip_id, recv_status_reg), 0);
 	hmer = xscom_wait_done();
 	if (hmer & SPR_HMER_XSCOM_FAIL)
 		goto fail;
 
 	/* Then we need to clear those two other registers on the target */
-	out_be64(xscom_addr(gcid, 0x2020007), 0);
+	out_be64(xscom_addr(gcid, log_reg), 0);
 	hmer = xscom_wait_done();
 	if (hmer & SPR_HMER_XSCOM_FAIL)
 		goto fail;
-	out_be64(xscom_addr(gcid, 0x2020009), 0);
+	out_be64(xscom_addr(gcid, err_reg), 0);
 	hmer = xscom_wait_done();
 	if (hmer & SPR_HMER_XSCOM_FAIL)
 		goto fail;
@@ -305,7 +317,8 @@ static int __xscom_write(uint32_t gcid, uint32_t pcb_addr, uint64_t val)
 /*
  * Indirect XSCOM access functions
  */
-static int xscom_indirect_read(uint32_t gcid, uint64_t pcb_addr, uint64_t *val)
+static int xscom_indirect_read_form0(uint32_t gcid, uint64_t pcb_addr,
+				     uint64_t *val)
 {
 	uint32_t addr;
 	uint64_t data;
@@ -348,7 +361,23 @@ static int xscom_indirect_read(uint32_t gcid, uint64_t pcb_addr, uint64_t *val)
 	return rc;
 }
 
-static int xscom_indirect_write(uint32_t gcid, uint64_t pcb_addr, uint64_t val)
+static int xscom_indirect_form(uint64_t pcb_addr)
+{
+	return (pcb_addr >> 60) & 1;
+}
+
+static int xscom_indirect_read(uint32_t gcid, uint64_t pcb_addr, uint64_t *val)
+{
+	uint64_t form = xscom_indirect_form(pcb_addr);
+
+	if ((proc_gen == proc_gen_p9) && (form == 1))
+		return OPAL_UNSUPPORTED;
+
+	return xscom_indirect_read_form0(gcid, pcb_addr, val);
+}
+
+static int xscom_indirect_write_form0(uint32_t gcid, uint64_t pcb_addr,
+				      uint64_t val)
 {
 	uint32_t addr;
 	uint64_t data;
@@ -356,6 +385,10 @@ static int xscom_indirect_write(uint32_t gcid, uint64_t pcb_addr, uint64_t val)
 
 	if (proc_gen < proc_gen_p8)
 		return OPAL_UNSUPPORTED;
+
+	/* Only 16 bit data with indirect */
+	if (val & ~(XSCOM_ADDR_IND_DATA))
+		return OPAL_PARAMETER;
 
 	/* Write indirect address & data */
 	addr = pcb_addr & 0x7fffffff;
@@ -384,6 +417,34 @@ static int xscom_indirect_write(uint32_t gcid, uint64_t pcb_addr, uint64_t val)
 	}
  bail:
 	return rc;
+}
+
+static int xscom_indirect_write_form1(uint32_t gcid, uint64_t pcb_addr,
+				      uint64_t val)
+{
+	uint32_t addr;
+	uint64_t data;
+
+	if (proc_gen < proc_gen_p9)
+		return OPAL_UNSUPPORTED;
+	if (val & ~(XSCOM_DATA_IND_FORM1_DATA))
+		return OPAL_PARAMETER;
+
+	/* Mangle address and data for form1 */
+	addr = (pcb_addr & 0x000ffffffff);
+	data = (pcb_addr & 0xfff00000000) << 20;
+	data |= val;
+	return __xscom_write(gcid, addr, data);
+}
+
+static int xscom_indirect_write(uint32_t gcid, uint64_t pcb_addr, uint64_t val)
+{
+	uint64_t form = xscom_indirect_form(pcb_addr);
+
+	if ((proc_gen == proc_gen_p9) && (form == 1))
+		return xscom_indirect_write_form1(gcid, pcb_addr, val);
+
+	return xscom_indirect_write_form0(gcid, pcb_addr, val);
 }
 
 static uint32_t xscom_decode_chiplet(uint32_t partid, uint64_t *pcb_addr)

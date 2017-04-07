@@ -134,9 +134,13 @@ static void add_opal_firmware_exports_node(struct dt_node *node)
 	struct dt_node *exports = dt_new(node, "exports");
 	uint64_t sym_start = (uint64_t)__sym_map_start;
 	uint64_t sym_size = (uint64_t)__sym_map_end - sym_start;
-
-	dt_add_property_u64s(exports, "symbol-map", sym_start, sym_size);
-	dt_add_property_u64s(exports, "hdat-map", SPIRA_HEAP_BASE,
+	/*
+	 * These property names will be used by Linux as the user-visible file
+	 * name, so make them meaningful if possible. We use _ as the separator
+	 * here to remain consistent with existing file names in /sys/opal.
+	 */
+	dt_add_property_u64s(exports, "symbol_map", sym_start, sym_size);
+	dt_add_property_u64s(exports, "hdat_map", SPIRA_HEAP_BASE,
 				SPIRA_HEAP_SIZE);
 }
 
@@ -178,11 +182,7 @@ void add_opal_node(void)
 	size = (CPU_STACKS_BASE +
 		(uint64_t)(cpu_max_pir + 1) * STACK_SIZE) - SKIBOOT_BASE;
 
-	if (!opal_node) {
-		opal_node = dt_new(dt_root, "ibm,opal");
-		assert(opal_node);
-	}
-
+	opal_node = dt_new_check(dt_root, "ibm,opal");
 	dt_add_property_cells(opal_node, "#address-cells", 0);
 	dt_add_property_cells(opal_node, "#size-cells", 0);
 

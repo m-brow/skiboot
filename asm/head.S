@@ -670,6 +670,8 @@ init_shared_sprs:
 	beq	3f
 	cmpwi	cr0,%r3,PVR_TYPE_P8NVL
 	beq	3f
+	cmpwi	cr0,%r3,PVR_TYPE_P9
+	beq	4f
 	/* Unsupported CPU type... what do we do ? */
 	b	9f
 
@@ -689,13 +691,7 @@ init_shared_sprs:
 	/* TSCR: Recommended value by HW folks */
 	LOAD_IMM32(%r3,0x8ACC6880)
 	mtspr	SPR_TSCR, %r3
-	mfspr	%r3,SPR_LPCR
-	rldicr	%r3,%r3,12,60
-	ori	%r3,%r3,4
-	rldicr	%r3,%r3,52,63
-	mtspr	SPR_LPCR,%r3
-	sync
-	isync
+
 	/* HID0: Clear bit 13 (enable core recovery)
 	 *       Clear bit 19 (HILE)
 	 */
@@ -724,16 +720,64 @@ init_shared_sprs:
 	/* RPR (per-LPAR but let's treat it as replicated for now) */
 	LOAD_IMM64(%r3,0x00000103070F1F3F)
 	mtspr	SPR_RPR,%r3
+	b	9f
+
+4:	/* P9 */
+	/* HID0: Clear bit 5 (enable core recovery)
+	 *       Clear bit 4 (HILE)
+	 */
+	mfspr	%r3,SPR_HID0
+	li	%r0,1
+	sldi	%r4,%r0,(63-5)
+	sldi	%r5,%r0,(63-4)
+	or	%r0,%r4,%r5,
+	andc	%r3,%r3,%r0
+	sync
+	mtspr	SPR_HID0,%r3
+	isync
+	/* HMEER: Enable HMIs for core recovery and TOD errors. */
+	LOAD_IMM64(%r0,SPR_HMEER_HMI_ENABLE_MASK)
+	mfspr	%r3,SPR_HMEER
+	or	%r3,%r3,%r0
+	sync
+	mtspr	SPR_HMEER,%r3
+	isync
 9:	blr
 
 .global init_replicated_sprs
 init_replicated_sprs:
-	/* LPCR: sane value */
-	LOAD_IMM64(%r3,0x0070000000000004)
-	mtspr	SPR_LPCR, %r3
+	mfspr	%r3,SPR_PVR
+	srdi	%r3,%r3,16
+	cmpwi	cr0,%r3,PVR_TYPE_P7
+	beq	1f
+	cmpwi	cr0,%r3,PVR_TYPE_P7P
+	beq	1f
+	cmpwi	cr0,%r3,PVR_TYPE_P8E
+	beq	3f
+	cmpwi	cr0,%r3,PVR_TYPE_P8
+	beq	3f
+	cmpwi	cr0,%r3,PVR_TYPE_P8NVL
+	beq	3f
+	cmpwi	cr0,%r3,PVR_TYPE_P9
+	beq	3f
+	/* Unsupported CPU type... what do we do ? */
+	b	9f
 
-	/* XXX TODO: Add more */
-	blr
+1:	/* P7, P7+ */
+	/* LPCR: sane value */
+	LOAD_IMM64(%r3,0x0040000000000004)
+	mtspr	SPR_LPCR, %r3
+	sync
+	isync
+	b 9f
+
+3:	/* P8, P8E, P9 */
+	/* LPCR: sane value */
+	LOAD_IMM64(%r3,0x0040000000000000)
+	mtspr	SPR_LPCR, %r3
+	sync
+	isync
+9:	blr
 
 	.global enter_nap
 enter_nap:

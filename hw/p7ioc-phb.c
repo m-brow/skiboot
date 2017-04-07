@@ -1508,26 +1508,13 @@ static int p7ioc_device_init(struct phb *phb,
 			     struct pci_device *dev,
 			     void *data __unused)
 {
-	int ecap = 0;
-	int aercap = 0;
-
-	/* Figure out AER capability */
-	if (pci_has_cap(dev, PCI_CFG_CAP_ID_EXP, false)) {
-		ecap = pci_cap(dev, PCI_CFG_CAP_ID_EXP, false);
-
-		if (!pci_has_cap(dev, PCIECAP_ID_AER, true)) {
-			aercap = pci_find_ecap(phb, dev->bdfn,
-					       PCIECAP_ID_AER, NULL);
-			if (aercap > 0)
-				pci_set_cap(dev, PCIECAP_ID_AER, aercap, true);
-		} else {
-			aercap = pci_cap(dev, PCIECAP_ID_AER, true);
-		}
-	}
+	int ecap, aercap;
 
 	/* Common initialization for the device */
 	pci_device_init(phb, dev);
 
+        ecap = pci_cap(dev, PCI_CFG_CAP_ID_EXP, false);
+        aercap = pci_cap(dev, PCIECAP_ID_AER, true);
 	if (dev->dev_type == PCIE_TYPE_ROOT_PORT)
 		p7ioc_root_port_init(phb, dev, ecap, aercap);
 	else if (dev->dev_type == PCIE_TYPE_SWITCH_UPPORT ||
@@ -2331,6 +2318,7 @@ static const struct phb_ops p7ioc_phb_ops = {
 	.choose_bus		= p7ioc_choose_bus,
 	.get_reserved_pe_number	= p7ioc_get_reserved_pe_number,
 	.device_init		= p7ioc_device_init,
+	.device_remove		= NULL,
 	.pci_reinit		= p7ioc_pci_reinit,
 	.eeh_freeze_status	= p7ioc_eeh_freeze_status,
 	.eeh_freeze_clear	= p7ioc_eeh_freeze_clear,
