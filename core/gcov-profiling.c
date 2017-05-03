@@ -51,6 +51,8 @@ struct gcov_info *gcov_info_list;
 
 void __gcov_init(struct gcov_info* f);
 void skiboot_gcov_done(void);
+void *skiboot_gcov_base(void);
+int skiboot_gcov_size(void);
 void __gcov_flush(void) __attrconst;
 void __gcov_merge_add(gcov_type *counters, unsigned int n_counters) __attrconst;
 void __gcov_merge_single(gcov_type *counters, unsigned int n_counters) __attrconst;
@@ -88,6 +90,22 @@ void skiboot_gcov_done(void)
 	printf("GCOV: gcov_info_list at 0x%p\n", gcov_info_list);
 }
 
+void *skiboot_gcov_base(void)
+{
+	return (void *)gcov_info_list;
+}
+
+int skiboot_gcov_size(void)
+{
+	int n = 0;
+	struct gcov_info *i = gcov_info_list;
+
+	while (i->next) {
+		n += sizeof(struct gcov_info);
+		i = i->next;
+	}
+	return n;
+}
 
 void __gcov_merge_add(gcov_type *counters, unsigned int n_counters)
 {

@@ -51,6 +51,11 @@ static uint64_t opal_dynamic_events;
 extern uint32_t attn_trigger;
 extern uint32_t hir_trigger;
 
+#ifdef SKIBOOT_GCOV
+void *skiboot_gcov_base(void);
+int skiboot_gcov_size(void);
+#endif
+
 void opal_table_init(void)
 {
 	struct opal_table_entry *s = __opal_table_start;
@@ -142,6 +147,10 @@ static void add_opal_firmware_exports_node(struct dt_node *node)
 	dt_add_property_u64s(exports, "symbol_map", sym_start, sym_size);
 	dt_add_property_u64s(exports, "hdat_map", SPIRA_HEAP_BASE,
 				SPIRA_HEAP_SIZE);
+#ifdef SKIBOOT_GCOV
+	dt_add_property_u64s(exports, "gcov", (uint64_t)skiboot_gcov_base(),
+				skiboot_gcov_size());
+#endif
 }
 
 static void add_opal_firmware_node(void)
