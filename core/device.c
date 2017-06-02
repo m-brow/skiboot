@@ -376,11 +376,19 @@ struct dt_node *dt_find_by_phandle(struct dt_node *root, u32 phandle)
 	return NULL;
 }
 
+/* Any property larger than MAX_ALLOC will be allocated using local_alloc */
+#define MAX_MALLOC 1048576
+
 static struct dt_property *new_property(struct dt_node *node,
 					const char *name, size_t size)
 {
-	struct dt_property *p = malloc(sizeof(*p) + size);
 	char *path;
+	struct dt_property *p;
+
+	if (size > MAX_MALLOC)
+		p = local_alloc(0, sizeof(*p)+size, 0x10000);
+	else
+		p = malloc(sizeof(*p) + size);
 
 	if (!p) {
 		path = dt_get_path(node);
