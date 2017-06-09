@@ -234,4 +234,6 @@ extern void set_bmc_platform(const struct bmc_platform *bmc);
 
 extern struct cpu_job* start_async_load(struct boot_resources *r);
 
+/* XZ decoding*/
+extern int decode_resource_xz(void **buf, size_t *len, size_t *uncomp_len);
 #endif /* __PLATFORM_H */
