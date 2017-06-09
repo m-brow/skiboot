@@ -42,6 +42,18 @@ struct bmc_platform {
 	uint32_t ipmi_oem_pnor_access_status;
 };
 
+struct boot_resources {
+	void  *kernel_base;
+	size_t kernel_size;
+	bool   kernel_loaded;
+
+	void  *initramfs_base;
+	size_t initramfs_size;
+	bool   initramfs_loaded;
+	/* Success of loading boot resources */
+	bool    success;
+};
+
 /*
  * Each platform can provide a set of hooks
  * that can affect the generic code
@@ -168,6 +180,16 @@ struct platform {
 	int		(*resource_loaded)(enum resource_id id, uint32_t idx);
 
 	/*
+	 * Returns a pointer to the cpu_job struct.
+	 * load_done is platform specific. On FSP machines we wait for the
+	 * initramfs to load, then decode it.
+	 * On BMC machines we first have to parse and setup the FIT, then
+	 * decode the initramfs.
+	 * This is done asyncronously.
+	 */
+	struct cpu_job* (*load_done)(struct boot_resources *r);
+
+	/*
 	 * Executed just prior to handing control over to the payload.
 	 */
 	void		(*exit)(void);
@@ -209,5 +231,7 @@ extern int resource_loaded(enum resource_id id, uint32_t idx);
 extern int wait_for_resource_loaded(enum resource_id id, uint32_t idx);
 
 extern void set_bmc_platform(const struct bmc_platform *bmc);
+
+extern struct cpu_job* start_async_load(struct boot_resources *r);
 
 #endif /* __PLATFORM_H */

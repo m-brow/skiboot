@@ -261,3 +261,14 @@ int wait_for_resource_loaded(enum resource_id id, uint32_t idx)
 	      id, idx, waited);
 	return r;
 }
+
+/* Start async job to load and setup the boot resources */
+struct cpu_job* start_async_load(struct boot_resources *r)
+{
+	if (!platform.load_done) {
+		printf("PLATFORM: start_async_load not supported on this arch");
+		return NULL;
+	}
+
+	return platform.load_done(r);
+}

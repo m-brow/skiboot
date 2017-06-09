@@ -23,6 +23,7 @@
  * If we are going to support P8 PSI and FSP2, we probably want
  * to split the PSI support from the FSP support proper first.
  */
+#include <skiboot.h>
 #include <stdarg.h>
 #include <processor.h>
 #include <io.h>
@@ -38,6 +39,8 @@
 #include <opal.h>
 #include <opal-msg.h>
 #include <ccan/list/list.h>
+#include <libxz/xz.h>
+#include <string.h>
 
 DEFINE_LOG_ENTRY(OPAL_RC_FSP_POLL_TIMEOUT, OPAL_PLATFORM_ERR_EVT, OPAL_FSP,
 		 OPAL_PLATFORM_FIRMWARE, OPAL_ERROR_PANIC, OPAL_NA);
@@ -2634,4 +2637,60 @@ void fsp_used_by_console(void)
 	 */
 	lock(&fsp_lock);
 	unlock(&fsp_lock);
+}
+
+struct boot_resources *boot_res;
+static struct cpu_job *fsp_load_res_job = NULL;
+
+static void fsp_setup_boot_resource(void *data __unused)
+{
+	int r, waited;
+	size_t len;
+	void *buf;
+
+	waited = 0;
+	/* Wait for initramfs to load */
+	do {
+		opal_run_pollers();
+		r = fsp_resource_loaded(RESOURCE_ID_INITRAMFS,
+					RESOURCE_SUBID_NONE);
+		if (r != OPAL_BUSY)
+			break;
+		time_wait_ms_nopoll(5);
+		waited += 5;
+	}
+	while (r == OPAL_BUSY);
+
+	boot_res->initramfs_loaded = true;
+	prlog(PR_PRINTF, "FSP: fsp_decode_resource loaded INITRAMFS %u ms\n",
+			waited);
+
+	/* Decode the initramfs*/
+	buf = boot_res->initramfs_base;
+	len = boot_res->initramfs_size;
+
+	r = decode_resource_xz(&buf, &len, NULL);
+	printf("FSP: deocde result r=%i\n", r);
+
+	if (r) {
+		boot_res->initramfs_base = buf;
+		boot_res->initramfs_size = len;
+	}
+
+	boot_res->success = true;
+	return;
+}
+
+struct cpu_job* fsp_load_boot_resource(struct boot_resources *r)
+{
+	boot_res = r;
+	if (fsp_load_res_job)
+		cpu_wait_job(fsp_load_res_job, true);
+
+	fsp_load_res_job = cpu_queue_job(NULL, "fsp_setup_boot_resource",
+					 fsp_setup_boot_resource, NULL);
+
+	cpu_process_local_jobs();
+
+	return fsp_load_res_job;
 }

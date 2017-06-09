@@ -47,6 +47,8 @@
 #include <nvram.h>
 #include <libstb/stb.h>
 #include <libstb/container.h>
+#include <timebase.h>
+#include "libxz/xz.h"
 
 enum proc_gen proc_gen;
 unsigned int pcie_max_link_speed;
@@ -302,33 +304,49 @@ extern char __builtin_kernel_start[];
 extern char __builtin_kernel_end[];
 extern uint64_t boot_offset;
 
-static size_t initramfs_size;
+static struct boot_resources boot_res = {
+	.kernel_base      = KERNEL_LOAD_BASE,
+	.kernel_size      = KERNEL_LOAD_SIZE,
+	.kernel_loaded    = false,
+	.initramfs_base   = INITRAMFS_LOAD_BASE,
+	.initramfs_size   = INITRAMFS_LOAD_SIZE,
+	.initramfs_loaded = false,
+	.success          = false,
+};
+static struct cpu_job *load_boot_resource_job = NULL;
 
 bool start_preload_kernel(void)
 {
 	int loaded;
-
+	
 	/* Try to load an external kernel payload through the platform hooks */
-	kernel_size = KERNEL_LOAD_SIZE;
 	loaded = start_preload_resource(RESOURCE_ID_KERNEL,
 					RESOURCE_SUBID_NONE,
 					KERNEL_LOAD_BASE,
-					&kernel_size);
+					&boot_res.kernel_size);
 	if (loaded != OPAL_SUCCESS) {
 		printf("INIT: platform start load kernel failed\n");
 		kernel_size = 0;
 		return false;
 	}
 
-	initramfs_size = INITRAMFS_LOAD_SIZE;
 	loaded = start_preload_resource(RESOURCE_ID_INITRAMFS,
 					RESOURCE_SUBID_NONE,
-					INITRAMFS_LOAD_BASE, &initramfs_size);
+					INITRAMFS_LOAD_BASE,
+					&boot_res.initramfs_size);
 	if (loaded != OPAL_SUCCESS) {
 		printf("INIT: platform start load initramfs failed\n");
-		initramfs_size = 0;
 		return false;
 	}
+
+
+	/*
+	 * Async job to load, configure and decode kernel and initramfs
+	 * This is platform specific. FSPs only have to decode the initramfs.
+	 * BMCs have to parse the FIT, configure the resource locations, then
+	 * decode the initramfs.
+	 */
+	load_boot_resource_job = start_async_load(&boot_res);
 
 	return true;
 }
@@ -342,12 +360,16 @@ static bool load_kernel(void)
 
 	prlog(PR_NOTICE, "INIT: Waiting for kernel...\n");
 
-	loaded = wait_for_resource_loaded(RESOURCE_ID_KERNEL,
-					  RESOURCE_SUBID_NONE);
+	/* If on FSP machine, initramfs is decoded but need to load the kernel*/
+	if (!boot_res.kernel_loaded) {
 
-	if (loaded != OPAL_SUCCESS) {
-		printf("INIT: platform wait for kernel load failed\n");
-		kernel_size = 0;
+		loaded = wait_for_resource_loaded(RESOURCE_ID_KERNEL,
+						  RESOURCE_SUBID_NONE);
+
+		if (loaded != OPAL_SUCCESS) {
+			printf("INIT: platform wait for kernel load failed\n");
+			kernel_size = 0;
+		}
 	}
 
 	/* Try embedded kernel payload */
@@ -395,6 +417,9 @@ static bool load_kernel(void)
 		}
 	}
 
+	if (boot_res.success)
+		kh = (struct elf_hdr *)boot_res.kernel_base;
+
 	printf("INIT: Kernel loaded, size: %zu bytes (0 = unknown preload)\n",
 	       kernel_size);
 
@@ -433,23 +458,27 @@ static bool load_kernel(void)
 
 static void load_initramfs(void)
 {
-	int loaded;
+	int loaded = 0;
 
-	loaded = wait_for_resource_loaded(RESOURCE_ID_INITRAMFS,
-					  RESOURCE_SUBID_NONE);
+	printf("INIT: called load_initramfs\n");
+	if (!boot_res.initramfs_loaded)
+		loaded = wait_for_resource_loaded(RESOURCE_ID_INITRAMFS,
+						  RESOURCE_SUBID_NONE);
 
-	if (loaded != OPAL_SUCCESS || !initramfs_size)
+	if (loaded != OPAL_SUCCESS || !boot_res.initramfs_size)
 		return;
 
 	dt_check_del_prop(dt_chosen, "linux,initrd-start");
 	dt_check_del_prop(dt_chosen, "linux,initrd-end");
 
-	printf("INIT: Initramfs loaded, size: %zu bytes\n", initramfs_size);
+	printf("INIT: Initramfs loaded, base: %p, size: %zu bytes\n",
+			boot_res.initramfs_base, boot_res.initramfs_size);
 
 	dt_add_property_u64(dt_chosen, "linux,initrd-start",
-			(uint64_t)INITRAMFS_LOAD_BASE);
+			    (uint64_t)boot_res.initramfs_base);
 	dt_add_property_u64(dt_chosen, "linux,initrd-end",
-			(uint64_t)INITRAMFS_LOAD_BASE + initramfs_size);
+			    (uint64_t)boot_res.initramfs_base +
+				  boot_res.initramfs_size);
 }
 
 int64_t mem_dump_free(void);
@@ -551,6 +580,23 @@ void __noreturn load_and_boot_kernel(bool is_reboot)
 	if (kernel_32bit)
 		start_kernel32(kernel_entry, fdt, mem_top);
 	start_kernel(kernel_entry, fdt, mem_top);
+}
+
+static int wait_for_async_load(void)
+{
+	cpu_wait_job(load_boot_resource_job, true);
+	prlog(PR_PRINTF, "Completed async job. boot_res.success = %i, \
+			kernel_base %p, size %lu \n",
+			boot_res.success, boot_res.kernel_base,
+			boot_res.kernel_size);
+
+	/* Set new local values for kernel base and size */
+	if (boot_res.kernel_loaded) {
+		kernel_entry = (uint64_t)boot_res.kernel_base;
+		kernel_size  = boot_res.kernel_size;
+	}
+
+	return OPAL_SUCCESS;
 }
 
 static void dt_fixups(void)
@@ -936,6 +982,10 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 
 	phb3_preload_vpd();
 	phb3_preload_capp_ucode();
+
+	/* Initialise crc32 tables before trying to decode */
+	xz_crc32_init();
+
 	start_preload_kernel();
 
 	/* NX init */
@@ -977,6 +1027,10 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 
 	/* Add the list of interrupts going to OPAL */
 	add_opal_interrupts();
+
+	/* Wait for async job to setup images*/
+	if (load_boot_resource_job)
+		wait_for_async_load();
 
 	/* Now release parts of memory nodes we haven't used ourselves... */
 	mem_region_release_unused();

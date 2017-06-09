@@ -756,6 +756,9 @@ extern int fsp_resource_loaded(enum resource_id id, uint32_t idx);
 extern int fsp_preload_lid(uint32_t lid_no, char *buf, size_t *size);
 extern int fsp_wait_lid_loaded(uint32_t lid_no);
 
+/* Setup boot resources */
+extern struct cpu_job* fsp_load_boot_resource(struct boot_resources *r);
+
 /* FSP console stuff */
 extern void fsp_console_preinit(void);
 extern void fsp_console_init(void);
