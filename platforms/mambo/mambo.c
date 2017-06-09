@@ -306,4 +306,5 @@ DECLARE_PLATFORM(mambo) = {
 	.nvram_info		= fake_nvram_info,
 	.nvram_start_read	= fake_nvram_start_read,
 	.nvram_write		= fake_nvram_write,
+	.load_done		= flash_load_boot_resource,
 };
