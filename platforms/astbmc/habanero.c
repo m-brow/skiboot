@@ -147,6 +147,7 @@ DECLARE_PLATFORM(habanero) = {
 	.elog_commit		= ipmi_elog_commit,
 	.start_preload_resource	= flash_start_preload_resource,
 	.resource_loaded	= flash_resource_loaded,
+	.load_done		= flash_load_boot_resource,
 	.exit			= ipmi_wdt_final_reset,
 	.terminate		= ipmi_terminate,
 };
