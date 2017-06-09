@@ -20,6 +20,7 @@
 #include <opal.h>
 #include <opal-msg.h>
 #include <device.h>
+#include <libfdt/libfdt.h>
 #include <libflash/libflash.h>
 #include <libflash/libffs.h>
 #include <libflash/blocklevel.h>
@@ -27,6 +28,9 @@
 #include <libstb/stb.h>
 #include <libstb/container.h>
 #include <elf.h>
+#include <timebase.h>
+#include <libxz/xz.h>
+#include <string.h>
 
 struct flash {
 	struct list_node	list;
@@ -612,7 +616,11 @@ static int flash_load_resource(enum resource_id id, uint32_t subid,
 			if (!content_size) {
 				prerror("FLASH: Invalid ELF header part %s\n",
 					name);
-				goto out_free_ffs;
+				/* Check for DT header */
+				if (!fdt_check_header(buf))
+					content_size = fdt_totalsize(buf);
+				else
+					goto out_free_ffs;
 			}
 			prlog(PR_DEBUG, "FLASH: computed %s size %u\n",
 			      name, content_size);
@@ -789,4 +797,151 @@ int flash_start_preload_resource(enum resource_id id, uint32_t subid,
 		start_flash_load_resource_job();
 
 	return OPAL_SUCCESS;
+}
+
+struct boot_resources *boot_res;
+static struct dt_node *uImg_root;
+static size_t initramfs_uncomp_size = 0;
+static struct cpu_job *flash_load_res_job = NULL;
+
+/*
+ * setup_boot_resource_dt parses the device-tree and configures the locations
+ * of the boot resources.
+ * The default configuration will be used. If there is no default property,
+ * we take the first configuration.
+ */
+static void setup_boot_resource_dt(void)
+{
+	const struct dt_property *def_conf, *kname, *rname, *kdata, *rdata, *usize;
+	char *kernel_name, *ramdisk_name, *end;
+	struct dt_node *node;
+
+	/* Find configuration node*/
+	node = dt_find_by_name(uImg_root, "configurations");
+
+	if (!node) {
+		prlog(PR_PRINTF, "FLASH: FDT configurations node not found\n");
+		return;
+	}
+
+	/* Find default config property */
+	def_conf = dt_find_property(node, "default");
+
+	if (!def_conf) {
+		/* If no default node, take first config child node as default */
+		node = dt_first(node);
+		if (!node) {
+			prlog(PR_PRINTF, "FLASH: FDT has empty configuration list\n");
+			return;
+		}
+	}
+	else {
+		/* Get node for config based on default value */
+		node = dt_find_by_name(node, def_conf->prop);
+	}
+
+
+	/* Find corresponding kernel and ramdisk names for the config */
+	kname = dt_find_property(node, "kernel");
+	kernel_name = (char *)kname->prop;
+
+	rname = dt_find_property(node, "ramdisk");
+	ramdisk_name = (char *)rname->prop;
+
+	/* Setup kernel location */
+	node = dt_find_by_name(uImg_root, kernel_name);
+	kdata = dt_find_property(node, "data");
+	if (kdata) {
+		boot_res->kernel_size = kdata->len;
+		boot_res->kernel_base = (void *)&kdata->prop;
+	}
+
+
+	/* Setup initramfs location */
+	node = dt_find_by_name(uImg_root, ramdisk_name);
+	rdata = dt_find_property(node, "data");
+	if (rdata) {
+		boot_res->initramfs_size = rdata->len;
+		boot_res->initramfs_base = (void *)&rdata->prop;
+		boot_res->initramfs_loaded = true;
+	}
+
+	/* Setup uncompressed size of the initramfs (optional property) */
+	usize = dt_find_property(node, "uncompressed_size");
+	if (usize)
+		initramfs_uncomp_size = strtol(usize->prop, &end, 10);
+}
+
+/*
+ * flash_setup_boot_resources is used to setup the location of the boot
+ * resources and decode the initramfs.
+ * The information is passed through a FDT in the BOOTKERNEL partition.
+ * This method is only used on BMC machines.
+ */
+static void flash_setup_boot_resource(void *data __unused)
+{
+	int loaded, waited, r;
+	void *buf;
+	size_t len;
+	char *strt;
+
+	waited = 0;
+
+	/* Wait for the kernel to be loaded */
+	do {
+		opal_run_pollers();
+		r = flash_resource_loaded(RESOURCE_ID_KERNEL, RESOURCE_SUBID_NONE);
+		time_wait_ms_nopoll(5);
+		if (r != OPAL_BUSY)
+			break;
+		time_wait_ms_nopoll(5);
+		waited += 10;
+
+	}
+	while (r == OPAL_BUSY);
+
+	boot_res->kernel_loaded = true;
+
+	strt = (char *)boot_res->kernel_base;
+
+	prlog(PR_PRINTF, "FLASH: waited %u ms for kernel\n", waited);
+
+	/* Setup kernel and initramfs FDT */
+	uImg_root = dt_new_root("uImage");
+	loaded = dt_expand_node(uImg_root, boot_res->kernel_base, 0);
+
+	if (loaded < 0)
+		return;
+
+	setup_boot_resource_dt();
+
+	/* Now the resources have been setup, try and decode the initramfs */
+	buf = boot_res->initramfs_base;
+	len = boot_res->initramfs_size;
+
+	r = decode_resource_xz(&buf, &len, &initramfs_uncomp_size);
+
+	if (r == XZ_STREAM_END) {
+		/* Set new initramfs location */
+		boot_res->initramfs_base = buf;
+		boot_res->initramfs_size = len;
+	}
+
+	boot_res->success = true;
+
+	return;
+}
+
+struct cpu_job* flash_load_boot_resource(struct boot_resources *r)
+{
+	boot_res = r;
+	if (flash_load_res_job)
+		cpu_wait_job(flash_load_res_job, true);
+
+	flash_load_res_job = cpu_queue_job(NULL, "flash_setup_boot_resource",
+					   flash_setup_boot_resource, NULL);
+
+	cpu_process_local_jobs();
+
+	return flash_load_res_job;
 }
