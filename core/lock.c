@@ -1,4 +1,4 @@
-/* Copyright 2013-2014 IBM Corp.
+/* Copyright 2013-2017 IBM Corp.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -66,6 +66,73 @@ static inline void lock_check(struct lock *l) { };
 static inline void unlock_check(struct lock *l) { };
 #endif /* DEBUG_LOCKS */
 
+#ifdef DEBUG_DEADLOCKS
+
+#define MAX_THREADS 2048
+static struct lock *lock_table[MAX_THREADS];
+
+/* Find circular dependencies in the lock requests. */
+static bool check_deadlock(void)
+{
+	int lock_owner, i, start;
+	struct lock *next;
+
+	start = this_cpu()->pir;
+	next = lock_table[start];
+	i = 0;
+
+	while (i < MAX_THREADS) {
+
+		if (!next)
+			return false;
+
+		if (!(next->lock_val & 1) || next->in_con_path)
+			return false;
+
+		lock_owner = next->lock_val >> 32;
+
+		if (lock_owner >= MAX_THREADS)
+			return false;
+
+		if (lock_owner == start && i > 0)
+			return true;
+
+		next = lock_table[lock_owner];
+		i++;
+	}
+
+	return false;
+}
+
+static void add_lock_request(struct lock *l)
+{
+	if (this_cpu()->state == cpu_state_active ||
+	    this_cpu()->state == cpu_state_os) {
+
+		if (this_cpu()->pir >= MAX_THREADS)
+			return;
+
+		lock_table[this_cpu()->pir] = l;
+
+		if (check_deadlock() && check_deadlock()) {
+#ifdef DEBUG_LOCKS
+			lock_error(l, "Deadlock detected", 0);
+#else
+			prlog(PR_EMERG, "LOCK: Deadlock detected\n");
+			backtrace();
+			abort();
+#endif /* DEBUG_LOCKS */
+		}
+	}
+}
+
+static void remove_lock_request(void)
+{
+	if (this_cpu()->pir < MAX_THREADS)
+		lock_table[this_cpu()->pir] = NULL;
+}
+#endif /* DEBUG_DEADLOCKS */
+
 bool lock_held_by_me(struct lock *l)
 {
 	uint64_t pir64 = this_cpu()->pir;
@@ -86,10 +153,19 @@ bool try_lock(struct lock *l)
 
 void lock(struct lock *l)
 {
+
 	if (bust_locks)
 		return;
 
 	lock_check(l);
+
+#ifdef DEBUG_DEADLOCKS
+	if (try_lock(l))
+		return;
+
+	add_lock_request(l);
+#endif
+
 	for (;;) {
 		if (try_lock(l))
 			break;
@@ -98,6 +174,11 @@ void lock(struct lock *l)
 			barrier();
 		smt_medium();
 	}
+
+#ifdef DEBUG_DEADLOCKS
+	remove_lock_request();
+#endif
+
 }
 
 void unlock(struct lock *l)
