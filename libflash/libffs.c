@@ -256,6 +256,7 @@ int ffs_init(uint32_t offset, uint32_t max_size, struct blocklevel_device *bl,
 	f->toc_offset = offset;
 	f->max_size = max_size;
 	f->bl = bl;
+	list_head_init(&f->hdr.entries);
 
 	/* Convert and check flash header */
 	rc = ffs_check_convert_header(&f->hdr, &raw_hdr);
@@ -298,7 +299,6 @@ int ffs_init(uint32_t offset, uint32_t max_size, struct blocklevel_device *bl,
 		goto out;
 	}
 
-	list_head_init(&f->hdr.entries);
 	for (i = 0; i < be32_to_cpu(raw_hdr.entry_count); i++) {
 		struct ffs_entry *ent = calloc(1, sizeof(struct ffs_entry));
 		if (!ent) {
@@ -781,7 +781,7 @@ int ffs_update_act_size(struct ffs_handle *ffs, uint32_t part_idx,
 		FL_DBG("FFS: Entry not found\n");
 		return FFS_ERR_PART_NOT_FOUND;
 	}
-	offset = ent->base;
+	offset = ffs->toc_offset + ffs_hdr_raw_size(part_idx);
 	FL_DBG("FFS: part index %d at offset 0x%08x\n",
 	       part_idx, offset);
 

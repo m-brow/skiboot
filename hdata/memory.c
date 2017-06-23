@@ -409,7 +409,7 @@ static void get_hb_reserved_mem(struct HDIF_common_hdr *ms_vpd)
 {
 	const struct msvpd_hb_reserved_mem *hb_resv_mem;
 	u64 start_addr, end_addr, label_size;
-	int unnamed = 0, count, i;
+	int count, i;
 	char *label;
 
 	/*
@@ -457,26 +457,67 @@ static void get_hb_reserved_mem(struct HDIF_common_hdr *ms_vpd)
 		if (label_size > 64)
 			label_size = 64;
 
-		/* these are broken, just ignore them */
-		if (!strncmp(hb_resv_mem->label, "ibm,homer-image", label_size))
-				continue;
-		if (!strncmp(hb_resv_mem->label, "ibm,occ-common-area", label_size))
-				continue;
-
 		label = malloc(label_size+1);
 		assert(label);
 
 		memcpy(label, hb_resv_mem->label, label_size);
 		label[label_size] = '\0';
 
-		if (strlen(label) == 0)
-			snprintf(label, 64, "hostboot-reserve-%d", unnamed++);
-
+		/* Unnamed reservations are always broken. Ignore them. */
+		if (strlen(label) == 0) {
+			free(label);
+			continue;
+		}
 
 		prlog(PR_DEBUG, "MEM: Reserve '%s' %#" PRIx64 "-%#" PRIx64 " (type/inst=0x%08x)\n",
 		      label, start_addr, end_addr, be32_to_cpu(hb_resv_mem->type_instance));
 
-		mem_reserve_hw(label, start_addr, end_addr - start_addr + 1);
+		mem_reserve_fw(label, start_addr, end_addr - start_addr + 1);
+	}
+}
+
+static void parse_trace_reservations(struct HDIF_common_hdr *ms_vpd)
+{
+	unsigned int size;
+	int count, i;
+
+	/*
+	 * The trace arrays are only setup when hostboot is explicitly
+	 * configured to enable them. We need to check and gracefully handle
+	 * when they're not present.
+	 */
+
+	if (!HDIF_get_idata(ms_vpd, MSVPD_IDATA_TRACE_AREAS, &size) || !size) {
+		prlog(PR_DEBUG, "MS VPD: No trace areas found.");
+		return;
+	}
+
+	count = HDIF_get_iarray_size(ms_vpd, MSVPD_IDATA_TRACE_AREAS);
+	if (count <= 0) {
+		prlog(PR_DEBUG, "MS VPD: No trace areas found.");
+		return;
+	}
+
+	prlog(PR_INFO, "MS VPD: Found %d trace areas\n", count);
+
+	for (i = 0; i < count; i++) {
+		const struct msvpd_trace *trace_area;
+		u64 start, end;
+
+		trace_area = HDIF_get_iarray_item(ms_vpd,
+				MSVPD_IDATA_TRACE_AREAS, i, &size);
+
+		if (!trace_area)
+			return; /* shouldn't happen */
+
+		start = be64_to_cpu(trace_area->start) & ~HRMOR_BIT;
+		end = be64_to_cpu(trace_area->end) & ~HRMOR_BIT;
+
+		prlog(PR_INFO,
+			"MSVPD: Trace area: 0x%.16"PRIx64"-0x%.16"PRIx64"\n",
+			start, end);
+
+		mem_reserve_hwbuf("trace-area", start, end - start);
 	}
 }
 
@@ -529,6 +570,8 @@ static bool __memory_parse(struct dt_node *root)
 	get_msareas(root, ms_vpd);
 
 	get_hb_reserved_mem(ms_vpd);
+
+	parse_trace_reservations(ms_vpd);
 
 	prlog(PR_INFO, "MS VPD: Total MB of RAM: 0x%llx\n",
 	       (long long)be64_to_cpu(tcms->total_in_mb));

@@ -353,6 +353,7 @@ struct iplparams_sysparams {
 	__be32		abc_bus_speed;
 	__be32		wxyz_bus_speed;
 	__be32		sys_eco_mode;
+#define SYS_ATTR_RISK_LEVEL PPC_BIT32(3)
 	__be32		sys_attributes;
 	__be32		mem_scrubbing;
 	__be16		cur_spl_value;
@@ -512,6 +513,11 @@ struct msvpd_pmover_bsr_synchro {
 } __packed;
 
 /* Idata index 3: Memory Trace Array */
+#define MSVPD_IDATA_TRACE_AREAS		3
+struct msvpd_trace {
+	__be64 start, end;
+	char reserved[16];
+};
 
 /* Idata index 4: UE Address Array */
 
@@ -1046,6 +1052,8 @@ struct sppcrd_chip_tod {
 /* Idata index 4 : Module VPD */
 #define SPPCRD_IDATA_MODULE_VPD	4
 
+/* Idata index 5 : Chip attached I2C devices */
+#define SPPCRD_IDATA_HOST_I2C	5
 
 /*
  * Host Services Data.

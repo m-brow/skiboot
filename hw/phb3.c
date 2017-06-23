@@ -30,6 +30,7 @@
 #include <affinity.h>
 #include <phb3.h>
 #include <phb3-regs.h>
+#include <phb3-capp.h>
 #include <capp.h>
 #include <fsp.h>
 #include <chip.h>
@@ -216,43 +217,26 @@ static void phb3_link_update(struct phb *phb, uint16_t data)
 	}
 }
 
-static void phb3_pcicfg_filter(struct phb *phb, uint32_t bdfn,
-			       uint32_t offset, uint32_t len,
-			       uint32_t *data, bool write)
+static int64_t phb3_pcicfg_rc_link_speed(void *dev,
+					 struct pci_cfg_reg_filter *pcrf __unused,
+					 uint32_t offset, uint32_t len,
+					 uint32_t *data,  bool write)
 {
-	struct pci_device *pd;
-	struct pci_cfg_reg_filter *pcrf;
-	uint32_t flags;
+	struct pci_device *pd = dev;
 
 	/* Hack for link speed changes. We intercept attempts at writing
 	 * the link control/status register
 	 */
-	if (bdfn == 0 && write && len == 4 && offset == 0x58) {
-		phb3_link_update(phb, (*data) >> 16);
-		return;
+	if (write && len == 4 && offset == 0x58) {
+		phb3_link_update(pd->phb, (*data) >> 16);
+		return OPAL_SUCCESS;
 	}
-	if (bdfn == 0 && write && len == 2 && offset == 0x5a) {
-		phb3_link_update(phb, *(uint16_t *)data);
-		return;
+	if (write && len == 2 && offset == 0x5a) {
+		phb3_link_update(pd->phb, *(uint16_t *)data);
+		return OPAL_SUCCESS;
 	}
 
-	/* FIXME: It harms the performance to search the PCI
-	 * device which doesn't have any filters at all. So
-	 * it's worthy to maintain a table in PHB to indicate
-	 * the PCI devices who have filters. However, bitmap
-	 * seems not supported by skiboot yet. To implement
-	 * it after bitmap is supported.
-	 */
-	pd = pci_find_dev(phb, bdfn);
-	pcrf = pd ? pci_find_cfg_reg_filter(pd, offset, len) : NULL;
-	if (!pcrf || !pcrf->func)
-		return;
-
-	flags = write ? PCI_REG_FLAG_WRITE : PCI_REG_FLAG_READ;
-	if ((pcrf->flags & flags) != flags)
-		return;
-
-	pcrf->func(pd, pcrf, offset, len, data, write);
+	return OPAL_PARTIAL;
 }
 
 #define PHB3_PCI_CFG_READ(size, type)	\
@@ -280,6 +264,11 @@ static int64_t phb3_pcicfg_read##size(struct phb *phb, uint32_t bdfn,	\
 		return OPAL_HARDWARE;					\
 	}								\
 									\
+	rc = pci_handle_cfg_filters(phb, bdfn, offset, sizeof(type),	\
+				    (uint32_t *)data, false);		\
+	if (rc != OPAL_PARTIAL)						\
+		return rc;						\
+									\
 	addr = PHB_CA_ENABLE;						\
 	addr = SETFIELD(PHB_CA_BDFN, addr, bdfn);			\
 	addr = SETFIELD(PHB_CA_REG, addr, offset);			\
@@ -294,9 +283,6 @@ static int64_t phb3_pcicfg_read##size(struct phb *phb, uint32_t bdfn,	\
 		*data = in_le##size(p->regs + PHB_CONFIG_DATA +		\
 				    (offset & (4 - sizeof(type))));	\
 	}								\
-									\
-	phb3_pcicfg_filter(phb, bdfn, offset, sizeof(type),		\
-			   (uint32_t *)data, false);			\
 									\
 	return OPAL_SUCCESS;						\
 }
@@ -323,6 +309,11 @@ static int64_t phb3_pcicfg_write##size(struct phb *phb, uint32_t bdfn,	\
 		return OPAL_HARDWARE;					\
 	}								\
 									\
+	rc = pci_handle_cfg_filters(phb, bdfn, offset, sizeof(type),	\
+				    (uint32_t *)&data, true);		\
+	if (rc != OPAL_PARTIAL)						\
+		return rc;						\
+									\
 	addr = PHB_CA_ENABLE;						\
 	addr = SETFIELD(PHB_CA_BDFN, addr, bdfn);			\
 	addr = SETFIELD(PHB_CA_REG, addr, offset);			\
@@ -338,9 +329,6 @@ static int64_t phb3_pcicfg_write##size(struct phb *phb, uint32_t bdfn,	\
 		out_le##size(p->regs + PHB_CONFIG_DATA +		\
 			     (offset & (4 - sizeof(type))), data);	\
 	}								\
-									\
-	phb3_pcicfg_filter(phb, bdfn, offset, sizeof(type),             \
-			   (uint32_t *)&data, true);			\
 									\
         return OPAL_SUCCESS;						\
 }
@@ -589,39 +577,40 @@ static void phb3_endpoint_init(struct phb *phb,
 static void phb3_check_device_quirks(struct phb *phb, struct pci_device *dev)
 {
 	struct phb3 *p = phb_to_phb3(phb);
-	u32 vdid;
-	u16 vendor, device;
 
 	if (dev->primary_bus != 0 &&
 	    dev->primary_bus != 1)
 		return;
 
-	pci_cfg_read32(phb, dev->bdfn, 0, &vdid);
-	vendor = vdid & 0xffff;
-	device = vdid >> 16;
-
 	if (dev->primary_bus == 1) {
 		u64 modectl;
 
-		/* For these adapters, if they are directly under the PHB, we
-		 * adjust some settings for performances
+		/*
+		 * For these adapters, if they are directly under the PHB, we
+		 * adjust the disable_wr_scope_group bit for performances
+		 *
+		 * 15b3:1003   Mellanox Travis3-EN (CX3)
+		 * 15b3:1011   Mellanox HydePark (ConnectIB)
+		 * 15b3:1013   Mellanox GlacierPark (CX4)
 		 */
 		xscom_read(p->chip_id, p->pe_xscom + 0x0b, &modectl);
-		if (vendor == 0x15b3 &&		/* Mellanox */
-		    (device == 0x1003 ||	/* Travis3-EN (CX3) */
-		     device == 0x1011 ||	/* HydePark (ConnectIB) */
-		     device == 0x1013))	{	/* GlacierPark (CX4) */
-			/* Set disable_wr_scope_group bit */
+		if (PCI_VENDOR_ID(dev->vdid) == 0x15b3 &&
+		    (PCI_DEVICE_ID(dev->vdid) == 0x1003	||
+		     PCI_DEVICE_ID(dev->vdid) == 0x1011 ||
+		     PCI_DEVICE_ID(dev->vdid) == 0x1013))
 			modectl |= PPC_BIT(14);
-		} else {
-			/* Clear disable_wr_scope_group bit */
+		else
 			modectl &= ~PPC_BIT(14);
-		}
-
 		xscom_write(p->chip_id, p->pe_xscom + 0x0b, modectl);
 	} else if (dev->primary_bus == 0) {
-		if (vendor == 0x1014 &&		/* IBM */
-		    device == 0x03dc) {		/* P8/P8E/P8NVL Root port */
+		/*
+		 * Emulate the prefetchable window of the root port
+		 * when the corresponding HW registers are readonly.
+		 *
+		 * 1014:03dc   Root port on P8/P8E/P8NVL
+		 */
+		if (PCI_VENDOR_ID(dev->vdid) == 0x1014 &&
+		    PCI_DEVICE_ID(dev->vdid) == 0x03dc) {
 			uint32_t pref_hi, tmp;
 
 			pci_cfg_read32(phb, dev->bdfn,
@@ -637,6 +626,11 @@ static void phb3_check_device_quirks(struct phb *phb, struct pci_device *dev)
 					PCI_CFG_PREF_MEM_BASE_U32, 12,
 					PCI_REG_FLAG_READ | PCI_REG_FLAG_WRITE,
 					phb3_pcicfg_rc_pref_window);
+			/* Add filter to control link speed */
+			pci_add_cfg_reg_filter(dev,
+					       0x58, 4,
+					       PCI_REG_FLAG_WRITE,
+					       phb3_pcicfg_rc_link_speed);
 		}
 	}
 }
@@ -2244,7 +2238,7 @@ static int64_t phb3_retry_state(struct pci_slot *slot)
 	slot->delay_tgt_tb = 0;
 	pci_slot_set_state(slot, slot->retry_state);
 	slot->retry_state = PCI_SLOT_STATE_NORMAL;
-	return slot->ops.poll(slot);
+	return slot->ops.run_sm(slot);
 }
 
 static int64_t phb3_poll_link(struct pci_slot *slot)
@@ -2437,139 +2431,21 @@ static int64_t phb3_freset(struct pci_slot *slot)
 	return OPAL_HARDWARE;
 }
 
-struct lock capi_lock = LOCK_UNLOCKED;
-static struct {
-	uint32_t			ec_level;
-	struct capp_lid_hdr		*lid;
-	size_t size;
-	int load_result;
-} capp_ucode_info = { 0, NULL, 0, false };
-
-#define CAPP_UCODE_MAX_SIZE 0x20000
-
-#define CAPP_UCODE_LOADED(chip, p) \
-	 ((chip)->capp_ucode_loaded & (1 << (p)->index))
-
-static int64_t capp_lid_download(void)
+static int64_t load_capp_ucode(struct phb3 *p)
 {
-	int64_t ret;
+	int64_t rc;
 
-	if (capp_ucode_info.load_result != OPAL_EMPTY)
-		return capp_ucode_info.load_result;
-
-	capp_ucode_info.load_result = wait_for_resource_loaded(
-		RESOURCE_ID_CAPP,
-		capp_ucode_info.ec_level);
-
-	if (capp_ucode_info.load_result != OPAL_SUCCESS) {
-		prerror("CAPP: Error loading ucode lid. index=%x\n",
-			capp_ucode_info.ec_level);
-		ret = OPAL_RESOURCE;
-		free(capp_ucode_info.lid);
-		capp_ucode_info.lid = NULL;
-		goto end;
-	}
-
-	ret = OPAL_SUCCESS;
-end:
-	return ret;
-}
-
-static int64_t capp_load_ucode(struct phb3 *p)
-{
-	struct proc_chip *chip = get_chip(p->chip_id);
-	struct capp_ucode_lid *ucode;
-	struct capp_ucode_data *data;
-	struct capp_lid_hdr *lid;
-	uint64_t rc, val, addr;
-	uint32_t chunk_count, offset, reg_offset;
-	int i;
-
-	if (CAPP_UCODE_LOADED(chip, p))
-		return OPAL_SUCCESS;
-
-	/* Return if PHB not attached to a CAPP unit */
 	if (p->index > PHB3_CAPP_MAX_PHB_INDEX(p))
 		return OPAL_HARDWARE;
 
-	rc = capp_lid_download();
-	if (rc)
-		return rc;
-
-	prlog(PR_INFO, "CHIP%i: CAPP ucode lid loaded at %p\n",
-	      p->chip_id, capp_ucode_info.lid);
-	lid = capp_ucode_info.lid;
-	/*
-	 * If lid header is present (on FSP machines), it'll tell us where to
-	 * find the ucode.  Otherwise this is the ucode.
-	 */
-	ucode = (struct capp_ucode_lid *)lid;
-	if (be64_to_cpu(lid->eyecatcher) == 0x434150504c494448) {
-		if (be64_to_cpu(lid->version) != 0x1) {
-			PHBERR(p, "capi ucode lid header invalid\n");
-			return OPAL_HARDWARE;
-		}
-		ucode = (struct capp_ucode_lid *)
-			((char *)ucode + be64_to_cpu(lid->ucode_offset));
-	}
-
-	if ((be64_to_cpu(ucode->eyecatcher) != 0x43415050554C4944) ||
-	    (ucode->version != 1)) {
-		PHBERR(p, "CAPP: ucode header invalid\n");
-		return OPAL_HARDWARE;
-	}
-
-	reg_offset = PHB3_CAPP_REG_OFFSET(p);
-	offset = 0;
-	while (offset < be64_to_cpu(ucode->data_size)) {
-		data = (struct capp_ucode_data *)
-			((char *)&ucode->data + offset);
-		chunk_count = be32_to_cpu(data->hdr.chunk_count);
-		offset += sizeof(struct capp_ucode_data_hdr) + chunk_count * 8;
-
-		if (be64_to_cpu(data->hdr.eyecatcher) != 0x4341505055434F44) {
-			PHBERR(p, "CAPP: ucode data header invalid:%i\n",
-			       offset);
-			return OPAL_HARDWARE;
-		}
-
-		switch (data->hdr.reg) {
-		case apc_master_cresp:
-			xscom_write(p->chip_id,
-				    CAPP_APC_MASTER_ARRAY_ADDR_REG + reg_offset,
-				    0);
-			addr = CAPP_APC_MASTER_ARRAY_WRITE_REG;
-			break;
-		case apc_master_uop_table:
-			xscom_write(p->chip_id,
-				    CAPP_APC_MASTER_ARRAY_ADDR_REG + reg_offset,
-				    0x180ULL << 52);
-			addr = CAPP_APC_MASTER_ARRAY_WRITE_REG;
-			break;
-		case snp_ttype:
-			xscom_write(p->chip_id,
-				    CAPP_SNP_ARRAY_ADDR_REG + reg_offset,
-				    0x5000ULL << 48);
-			addr = CAPP_SNP_ARRAY_WRITE_REG;
-			break;
-		case snp_uop_table:
-			xscom_write(p->chip_id,
-				    CAPP_SNP_ARRAY_ADDR_REG + reg_offset,
-				    0x4000ULL << 48);
-			addr = CAPP_SNP_ARRAY_WRITE_REG;
-			break;
-		default:
-			continue;
-		}
-
-		for (i = 0; i < chunk_count; i++) {
-			val = be64_to_cpu(data->data[i]);
-			xscom_write(p->chip_id, addr + reg_offset, val);
-		}
-	}
-
-	chip->capp_ucode_loaded |= (1 << p->index);
-	return OPAL_SUCCESS;
+	/* 0x434150504c494448 = 'CAPPLIDH' in ASCII */
+	rc = capp_load_ucode(p->chip_id, p->phb.opal_id, p->index,
+			0x434150504c494448, PHB3_CAPP_REG_OFFSET(p),
+			CAPP_APC_MASTER_ARRAY_ADDR_REG,
+			CAPP_APC_MASTER_ARRAY_WRITE_REG,
+			CAPP_SNP_ARRAY_ADDR_REG,
+			CAPP_SNP_ARRAY_WRITE_REG);
+	return rc;
 }
 
 static void do_capp_recovery_scoms(struct phb3 *p)
@@ -2582,7 +2458,7 @@ static void do_capp_recovery_scoms(struct phb3 *p)
 	offset = PHB3_CAPP_REG_OFFSET(p);
 	/* disable snoops */
 	xscom_write(p->chip_id, SNOOP_CAPI_CONFIG + offset, 0);
-	capp_load_ucode(p);
+	load_capp_ucode(p);
 	/* clear err rpt reg*/
 	xscom_write(p->chip_id, CAPP_ERR_RPT_CLR + offset, 0);
 	/* clear capp fir */
@@ -3518,6 +3394,38 @@ static int64_t phb3_get_diag_data(struct phb *phb,
 	return OPAL_SUCCESS;
 }
 
+static int64_t phb3_get_capp_info(int chip_id, struct phb *phb,
+				  struct capp_info *info)
+{
+	struct phb3 *p = phb_to_phb3(phb);
+	struct proc_chip *chip = get_chip(p->chip_id);
+	uint32_t offset;
+
+	if (chip_id != p->chip_id)
+		return OPAL_PARAMETER;
+
+	if (!((1 << p->index) & chip->capp_phb3_attached_mask))
+		return OPAL_PARAMETER;
+
+	offset = PHB3_CAPP_REG_OFFSET(p);
+
+	if (PHB3_IS_NAPLES(p)) {
+		if (p->index == 0)
+			info->capp_index = 0;
+		else
+			info->capp_index = 1;
+	} else
+		info->capp_index = 0;
+	info->phb_index = p->index;
+	info->capp_fir_reg = CAPP_FIR + offset;
+	info->capp_fir_mask_reg = CAPP_FIR_MASK + offset;
+	info->capp_fir_action0_reg = CAPP_FIR_ACTION0 + offset;
+	info->capp_fir_action1_reg = CAPP_FIR_ACTION1 + offset;
+	info->capp_err_status_ctrl_reg = CAPP_ERR_STATUS_CTRL + offset;
+
+	return OPAL_SUCCESS;
+}
+
 static void phb3_init_capp_regs(struct phb3 *p, bool dma_mode)
 {
 	uint64_t reg;
@@ -3724,10 +3632,14 @@ static int64_t enable_capi_mode(struct phb3 *p, uint64_t pe_number, bool dma_mod
 
 	phb3_init_capp_regs(p, dma_mode);
 
-	if (!chiptod_capp_timebase_sync(p)) {
+	if (!chiptod_capp_timebase_sync(p->chip_id, CAPP_TFMR, CAPP_TB,
+					PHB3_CAPP_REG_OFFSET(p))) {
 		PHBERR(p, "CAPP: Failed to sync timebase\n");
 		return OPAL_HARDWARE;
 	}
+
+	/* set callbacks to handle HMI events */
+	capi_ops.get_capp_info = &phb3_get_capp_info;
 
 	return OPAL_SUCCESS;
 }
@@ -3742,7 +3654,7 @@ static int64_t phb3_set_capi_mode(struct phb *phb, uint64_t mode,
 	uint32_t offset;
 	u8 mask;
 
-	if (!CAPP_UCODE_LOADED(chip, p)) {
+	if (!capp_ucode_loaded(chip, p->index)) {
 		PHBERR(p, "CAPP: ucode not loaded\n");
 		return OPAL_RESOURCE;
 	}
@@ -4598,6 +4510,9 @@ static void phb3_add_properties(struct phb3 *p)
 		IVT_TABLE_STRIDE);
 	dt_add_property_cells(np, "ibm,opal-rba-table",
 		hi32(p->tbl_rba), lo32(p->tbl_rba), RBA_TABLE_SIZE);
+
+	dt_add_property_cells(np, "ibm,phb-diag-data-size",
+			      sizeof(struct OpalIoPhb3ErrorData));
 }
 
 static bool phb3_calculate_windows(struct phb3 *p)
@@ -4677,7 +4592,7 @@ static bool phb3_host_sync_reset(void *data)
 		phb3_creset(slot);
 		return false;
 	default:
-		rc = slot->ops.poll(slot);
+		rc = slot->ops.run_sm(slot);
 		return rc <= OPAL_SUCCESS;
 	}
 }
@@ -4822,7 +4737,7 @@ static void phb3_create(struct dt_node *np)
 	phb3_init_hw(p, true);
 
 	/* Load capp microcode into capp unit */
-	capp_load_ucode(p);
+	load_capp_ucode(p);
 
 	opal_add_host_sync_notifier(phb3_host_sync_reset, p);
 
@@ -5017,67 +4932,6 @@ static void phb3_probe_pbcq(struct dt_node *pbcq)
 			      OPAL_PHB_CAPI_FLAG_SNOOP_CONTROL);
 
 	add_chip_dev_associativity(np);
-}
-
-int phb3_preload_capp_ucode(void)
-{
-	struct dt_node *p;
-	struct proc_chip *chip;
-	uint32_t index;
-	uint64_t rc;
-	int ret;
-
-	p = dt_find_compatible_node(dt_root, NULL, "ibm,power8-pbcq");
-
-	if (!p) {
-		printf("CAPI: WARNING: no compat thing found\n");
-		return OPAL_SUCCESS;
-	}
-
-	chip = get_chip(dt_get_chip_id(p));
-
-	rc = xscom_read_cfam_chipid(chip->id, &index);
-	if (rc) {
-		prerror("CAPP: Error reading cfam chip-id\n");
-		ret = OPAL_HARDWARE;
-		return ret;
-	}
-	/* Keep ChipID and Major/Minor EC.  Mask out the Location Code. */
-	index = index & 0xf0fff;
-
-	/* Assert that we're preloading */
-	assert(capp_ucode_info.lid == NULL);
-	capp_ucode_info.load_result = OPAL_EMPTY;
-
-	capp_ucode_info.ec_level = index;
-
-	/* Is the ucode preloaded like for BML? */
-	if (dt_has_node_property(p, "ibm,capp-ucode", NULL)) {
-		capp_ucode_info.lid = (struct capp_lid_hdr *)(u64)
-			dt_prop_get_u32(p, "ibm,capp-ucode");
-		ret = OPAL_SUCCESS;
-		goto end;
-	}
-	/* If we successfully download the ucode, we leave it around forever */
-	capp_ucode_info.size = CAPP_UCODE_MAX_SIZE;
-	capp_ucode_info.lid = malloc(CAPP_UCODE_MAX_SIZE);
-	if (!capp_ucode_info.lid) {
-		prerror("CAPP: Can't allocate space for ucode lid\n");
-		ret = OPAL_NO_MEM;
-		goto end;
-	}
-
-	printf("CAPI: Preloading ucode %x\n", capp_ucode_info.ec_level);
-
-	ret = start_preload_resource(RESOURCE_ID_CAPP, index,
-				     capp_ucode_info.lid,
-				     &capp_ucode_info.size);
-
-	if (ret != OPAL_SUCCESS)
-		prerror("CAPI: Failed to preload resource %d\n", ret);
-
-end:
-	return ret;
 }
 
 void phb3_preload_vpd(void)

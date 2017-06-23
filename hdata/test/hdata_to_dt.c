@@ -67,6 +67,7 @@ unsigned long tb_hz = 512000000;
 #define __CPU_H
 struct cpu_thread {
 	uint32_t			pir;
+	uint32_t			chip_id;
 };
 
 struct cpu_thread __boot_cpu, *boot_cpu = &__boot_cpu;
@@ -94,6 +95,11 @@ struct dt_node *add_ics_node(void)
 
 static bool spira_check_ptr(const void *ptr, const char *file, unsigned int line);
 
+/* should probably check this */
+#define BITS_PER_LONG 64
+/* not used, just needs to exist */
+#define cpu_max_pir 0x7
+
 #include "../cpu-common.c"
 #include "../fsp.c"
 #include "../hdif.c"
@@ -106,11 +112,14 @@ static bool spira_check_ptr(const void *ptr, const char *file, unsigned int line
 #include "../vpd-common.c"
 #include "../slca.c"
 #include "../hostservices.c"
+#include "../i2c.c"
 #include "../../core/vpd.c"
 #include "../../core/device.c"
 #include "../../core/chip.c"
 #include "../../test/dt_common.c"
 #include "../../core/fdt.c"
+#include "../../hw/phys-map.c"
+#include "../../core/mem_region.c"
 
 #include <err.h>
 
@@ -233,15 +242,19 @@ int main(int argc, char *argv[])
 			opt_count++;
 		} else if (strcmp(argv[i], "-7") == 0) {
 			fake_pvr_type = PVR_TYPE_P7;
+			proc_gen = proc_gen_p7;
 			opt_count++;
 		} else if (strcmp(argv[i], "-8E") == 0) {
 			fake_pvr_type = PVR_TYPE_P8;
+			proc_gen = proc_gen_p8;
 			opt_count++;
 		} else if (strcmp(argv[i], "-8") == 0) {
 			fake_pvr_type = PVR_TYPE_P8;
+			proc_gen = proc_gen_p8;
 			opt_count++;
 		} else if (strcmp(argv[i], "-9") == 0) {
 			fake_pvr_type = PVR_TYPE_P9;
+			proc_gen = proc_gen_p9;
 			opt_count++;
 		}
 	}
@@ -259,8 +272,17 @@ int main(int argc, char *argv[])
 		     "	-q Quiet mode\n"
 		     "	-b Keep blobs in the output\n"
 		     "\n"
-		     "Pipe to 'dtc -I dtb -O dts' for human readable\n");
+		     "  -7 Force PVR to POWER7\n"
+		     "  -8 Force PVR to POWER8\n"
+		     "  -8E Force PVR to POWER8E\n"
+		     "  -9 Force PVR to POWER9 (nimbus)\n"
+		     "\n"
+		     "When no PVR is specified -7 is assumed"
+		     "\n"
+		     "Pipe to 'dtc -I dtb -O dts' for human readable output\n");
 	}
+
+	phys_map_init();
 
 	/* Copy in spira dump (assumes little has changed!). */
 	if (new_spira) {
@@ -326,6 +348,9 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "FATAL ERROR parsing HDAT\n");
 		exit(EXIT_FAILURE);
 	}
+
+	mem_region_init();
+	mem_region_release_unused();
 
 	if (!blobs)
 		squash_blobs(dt_root);

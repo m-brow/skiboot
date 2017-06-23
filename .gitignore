@@ -23,6 +23,7 @@ GTAGS
 GRTAGS
 GPATH
 cscope.out
+compile_commands.json
 asm/asm-offsets.s
 include/asm-offsets.h
 version.c
@@ -66,6 +67,7 @@ external/mambo/skiboot-hello_world.dump
 external/memboot/memboot
 hdata/test/hdata_to_dt
 hdata/test/hdata_to_dt-gcov
+hw/test/phys-map-test
 hw/ipmi/test/run-fru
 hw/ipmi/test/*-gcov
 libc/test/run-time

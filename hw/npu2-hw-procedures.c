@@ -23,6 +23,10 @@
 #include <npu2-regs.h>
 #include <xscom.h>
 
+/* Set in npu2.c if there is an nvram override for the zcal settings on this
+ * machine */
+int nv_zcal_nominal = -1;
+
 /* PHY Registers. The documentation for the PHY training is written in
  * terms of bits within an actual register so we use that
  * representation here. */
@@ -204,11 +208,11 @@ static uint32_t reset_ndl(struct npu2_dev *ndev)
 
 	npu2_write_mask(ndev->npu, NPU2_NTL_PRI_CFG(ndev), val, -1ULL);
 
-	val = PPC_BIT(0) | PPC_BIT(1);
+	val = PPC_BIT32(0) | PPC_BIT32(1);
 
 	npu2_write_4b(ndev->npu, NPU2_NTL_DL_CONTROL(ndev), val);
 	npu2_write_4b(ndev->npu, NPU2_NTL_DL_CONTROL(ndev), 0);
-	npu2_write_4b(ndev->npu, NPU2_NTL_DL_CONFIG(ndev), PPC_BIT(0));
+	npu2_write_4b(ndev->npu, NPU2_NTL_DL_CONFIG(ndev), PPC_BIT32(0));
 
 	/* NTL Reset */
 	val = PPC_BIT(8) | PPC_BIT(9);
@@ -236,6 +240,8 @@ static uint32_t reset_ntl_release(struct npu2_dev *ndev)
 	npu2_write(ndev->npu, NPU2_NTL_RSP_HDR_CREDIT_RX(ndev), 0x0000BE0000000000);
 	npu2_write(ndev->npu, NPU2_NTL_CRED_DATA_CREDIT_RX(ndev), 0x0001000000000000);
 	npu2_write(ndev->npu, NPU2_NTL_RSP_DATA_CREDIT_RX(ndev), 0x0001000000000000);
+
+	npu2_set_link_flag(ndev, NPU2_DEV_DL_RESET);
 
 	return PROCEDURE_COMPLETE;
 }
@@ -297,9 +303,8 @@ DEFINE_PROCEDURE(phy_reset, phy_reset_wait, phy_reset_complete);
 
 static uint32_t phy_tx_zcal(struct npu2_dev *ndev)
 {
-	if (ndev->npu->tx_zcal_complete[ndev->index % 3])
+	if (ndev->npu->tx_zcal_complete[ndev->index > 2])
 		return PROCEDURE_COMPLETE;
-	ndev->npu->tx_zcal_complete[ndev->index % 3] = 1;
 
 	/* Turn off SW enable and enable zcal state machine */
 	phy_write(ndev, &NPU2_PHY_TX_ZCAL_SWO_EN, 0);
@@ -317,12 +322,15 @@ static uint32_t phy_tx_zcal_wait(struct npu2_dev *ndev)
 	done = phy_read(ndev, &NPU2_PHY_TX_ZCAL_DONE);
 	error = phy_read(ndev, &NPU2_PHY_TX_ZCAL_ERROR);
 
-	/* We have never seen this in the field and it is not
-	 * expected. Therefore it's best to error out which will
-	 * complain loudly in the logs than to continue with nominal
-	 * values which wont work well. */
-	if (error)
+	/* We have never seen this in the field and it is not expected.
+	 * Therefore it's best to error out which will complain loudly. Nominal
+	 * vaules may be set in nvram to ignore this error. */
+	if (error && nv_zcal_nominal < 0) {
+		NPU2DEVERR(ndev, "ZCAL failed. Nominal values may be used by"
+			   " setting nvram variable nv_zcal_override = 50\n");
+		NPU2DEVERR(ndev, "However this may impact link performance\n");
 		return PROCEDURE_COMPLETE | PROCEDURE_FAILED;
+	}
 
 	if (!done)
 		return PROCEDURE_INPROGRESS;
@@ -330,10 +338,9 @@ static uint32_t phy_tx_zcal_wait(struct npu2_dev *ndev)
 	return PROCEDURE_NEXT;
 }
 
-/* FIXME: What are the right values? I just chose the middle ones... */
-#define MARGIN_RATIO		(32)
-#define FFE_PRE_COEFF		(7)
-#define FFE_POST_COEFF		(12)
+#define MARGIN_RATIO		(0)
+#define FFE_PRE_COEFF		(0)
+#define FFE_POST_COEFF		(0)
 
 #define PRE_WIDTH		(5)
 #define POST_WIDTH		(7)
@@ -382,17 +389,14 @@ static uint32_t phy_tx_zcal_calculate(struct npu2_dev *ndev)
 	uint32_t margin_pd_select;
 	uint32_t margin_select;
 
-	if (ndev->index < 3) {
-		if (ndev->npu->tx_zcal_complete[0])
-			return PROCEDURE_COMPLETE;
+	if (nv_zcal_nominal < 0) {
+		/* Convert the value from 8R to 2R by / 4 */
+		zcal_n = phy_read(ndev, &NPU2_PHY_TX_ZCAL_N) / 4;
+		zcal_p = phy_read(ndev, &NPU2_PHY_TX_ZCAL_P) / 4;
 	} else {
-		if (ndev->npu->tx_zcal_complete[1])
-			return PROCEDURE_COMPLETE;
+		zcal_n = zcal_p = nv_zcal_nominal;
+		NPU2DEVINF(ndev, "Using nominal values for zcal, performance may be impacted\n");
 	}
-
-	/* Convert the value from 8R to 2R by / 4 */
-	zcal_n = phy_read(ndev, &NPU2_PHY_TX_ZCAL_N) / 4;
-	zcal_p = phy_read(ndev, &NPU2_PHY_TX_ZCAL_P) / 4;
 
 	/* Again, if the hardware detects an unexpected condition it's
 	 * better just to fail loudly. */
@@ -470,11 +474,7 @@ static uint32_t phy_tx_zcal_calculate(struct npu2_dev *ndev)
 	phy_write(ndev, &NPU2_PHY_TX_MARGINPU_SELECT, therm(margin_select + 1)/2);
 	phy_write(ndev, &NPU2_PHY_TX_MARGINPD_SELECT, therm(margin_select + 1)/2);
 
-	if (ndev->index < 3)
-		ndev->npu->tx_zcal_complete[0] = true;
-	else
-		ndev->npu->tx_zcal_complete[1] = true;
-
+	ndev->npu->tx_zcal_complete[ndev->index > 2] = 1;
 	return PROCEDURE_COMPLETE;
 }
 DEFINE_PROCEDURE(phy_tx_zcal, phy_tx_zcal_wait, phy_tx_zcal_calculate);

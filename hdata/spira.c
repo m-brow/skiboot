@@ -468,8 +468,10 @@ static bool add_xscom_sppcrd(uint64_t xscom_base)
 		/* Add PSI Host bridge */
 		add_psihb_node(np);
 
-		if (proc_gen >= proc_gen_p9)
+		if (proc_gen >= proc_gen_p9) {
 			add_xive_node(np);
+			parse_i2c_devs(hdif, SPPCRD_IDATA_HOST_I2C, np);
+		}
 	}
 
 	return i > 0;
@@ -789,6 +791,20 @@ static void add_nx(void)
 	}
 }
 
+static void add_nmmu(void)
+{
+	struct dt_node *xscom, *nmmu;
+
+	/* Nest MMU only exists on POWER9 */
+	if (proc_gen != proc_gen_p9)
+		return;
+
+	dt_for_each_compatible(dt_root, xscom, "ibm,xscom") {
+		nmmu = dt_new_addr(xscom, "nmmu", 0x5012c40);
+		dt_add_property_strings(nmmu, "compatible", "ibm,power9-nest-mmu");
+		dt_add_property_cells(nmmu, "reg", 0x5012c40, 0x20);
+	}
+}
 
 static void add_iplparams_sys_params(const void *iplp, struct dt_node *node)
 {
@@ -796,6 +812,7 @@ static void add_iplparams_sys_params(const void *iplp, struct dt_node *node)
 	const struct HDIF_common_hdr *hdif = iplp;
 	u16 version = be16_to_cpu(hdif->version);
 	const char *vendor = NULL;
+	u32 sys_attributes;
 
 	p = HDIF_get_idata(iplp, IPLPARAMS_SYSPARAMS, NULL);
 	if (!CHECK_SPPTR(p)) {
@@ -871,6 +888,10 @@ static void add_iplparams_sys_params(const void *iplp, struct dt_node *node)
 		vendor = "IBM";
 
 	dt_add_property_string(dt_root, "vendor", vendor);
+
+	sys_attributes = be32_to_cpu(p->sys_attributes);
+	if (sys_attributes & SYS_ATTR_RISK_LEVEL)
+		dt_add_property(node, "elevated-risk-level", NULL, 0);
 }
 
 static void add_iplparams_ipl_params(const void *iplp, struct dt_node *node)
@@ -1262,6 +1283,9 @@ int parse_hdat(bool is_opal)
 
 	/* Add NX */
 	add_nx();
+
+	/* Add nest mmu */
+	add_nmmu();
 
 	/* Add IO HUBs and/or PHBs */
 	io_parse();

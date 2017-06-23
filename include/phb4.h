@@ -275,6 +275,7 @@ struct phb4 {
 	uint64_t		mbt_cache[32][2];
 	uint64_t		mdt_cache[512]; /* max num of PEs */
 	uint64_t		mist_cache[4096/4];/* max num of MSIs */
+	uint64_t		pfir_cache;	/* Used by complete reset */
 	uint64_t		nfir_cache;	/* Used by complete reset */
 	bool			err_pending;
 	struct phb4_err		err;
@@ -304,6 +305,13 @@ static inline void phb4_set_err_pending(struct phb4 *p, bool pending)
 	}
 
 	p->err_pending = pending;
+}
+
+#define PHB4_PER_CHIP                        6 /* Max 6 PHBs per chip on p9 */
+
+static inline int phb4_get_opal_id(unsigned int chip_id, unsigned int index)
+{
+	return chip_id * PHB4_PER_CHIP + index;
 }
 
 #endif /* __PHB4_H */

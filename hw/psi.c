@@ -33,6 +33,7 @@
 #include <platform.h>
 #include <errorlog.h>
 #include <xive.h>
+#include <sbe-p9.h>
 
 static LIST_HEAD(psis);
 static u64 psi_link_timer;
@@ -485,7 +486,7 @@ static void psihb_p8_interrupt(struct irq_source *is, uint32_t isn)
 		psihb_interrupt(is, isn);
 		break;
 	case P8_IRQ_PSI_OCC:
-		occ_interrupt(psi->chip_id);
+		occ_p8_interrupt(psi->chip_id);
 		break;
 	case P8_IRQ_PSI_FSI:
 		printf("PSI: FSI irq received\n");
@@ -572,7 +573,7 @@ static void psihb_p9_interrupt(struct irq_source *is, uint32_t isn)
 		psihb_interrupt(is, isn);
 		break;
 	case P9_PSI_IRQ_OCC:
-		occ_interrupt(psi->chip_id);
+		occ_p9_interrupt(psi->chip_id);
 		break;
 	case P9_PSI_IRQ_FSI:
 		printf("PSI: FSI irq received\n");
@@ -603,7 +604,7 @@ static void psihb_p9_interrupt(struct irq_source *is, uint32_t isn)
 		printf("PSI: DIO irq received\n");
 		break;
 	case P9_PSI_IRQ_PSU:
-		printf("PSI: PSU irq received\n");
+		sbe_interrupt(psi->chip_id);
 		break;
 	}
 }
@@ -662,7 +663,7 @@ static char *psi_p9_irq_name(struct irq_source *is, uint32_t isn)
 	return strdup(names[idx]);
 }
 
-static void psi_p9_irq_dd1_eoi(struct irq_source *is, uint32_t isn)
+static void psi_p9_irq_ndd1_eoi(struct irq_source *is, uint32_t isn)
 {
 	struct psi *psi = is->data;
 	unsigned int idx = isn & 0xf;
@@ -673,11 +674,11 @@ static void psi_p9_irq_dd1_eoi(struct irq_source *is, uint32_t isn)
 	__xive_source_eoi(is, isn);
 }
 
-static const struct irq_source_ops psi_p9_dd1_irq_ops = {
+static const struct irq_source_ops psi_p9_ndd1_irq_ops = {
 	.interrupt = psihb_p9_interrupt,
 	.attributes = psi_p9_irq_attributes,
 	.name = psi_p9_irq_name,
-	.eoi = psi_p9_irq_dd1_eoi,
+	.eoi = psi_p9_irq_ndd1_eoi,
 };
 
 static const struct irq_source_ops psi_p9_irq_ops = {
@@ -821,7 +822,7 @@ static void psi_init_p8_interrupts(struct psi *psi)
 static void psi_init_p9_interrupts(struct psi *psi)
 {
 	struct proc_chip *c;
-	bool is_dd2;
+	bool is_p9ndd1;
 	u64 val;
 
 	/* Reset irq handling and switch to ESB mode */
@@ -855,22 +856,23 @@ static void psi_init_p9_interrupts(struct psi *psi)
 
 	/* Register sources */
 	c = next_chip(NULL);
-	is_dd2 = (c && c->ec_level >= 0x20);
+	is_p9ndd1 = (c && c->ec_level >= 0x10 &&
+		     c->type == PROC_CHIP_P9_NIMBUS);
 
-	if (is_dd2) {
+	if (is_p9ndd1) {
+		prlog(PR_DEBUG,
+		      "PSI[0x%03x]: Interrupts sources registered for P9N DD1.x\n",
+		      psi->chip_id);
+		xive_register_hw_source(psi->interrupt, P9_PSI_NUM_IRQS,
+					12, psi->esb_mmio, XIVE_SRC_LSI,
+					psi, &psi_p9_ndd1_irq_ops);
+	} else {
 		prlog(PR_DEBUG,
 		      "PSI[0x%03x]: Interrupts sources registered for P9 DD2.x\n",
 		      psi->chip_id);
 		xive_register_hw_source(psi->interrupt, P9_PSI_NUM_IRQS,
 					12, psi->esb_mmio, XIVE_SRC_LSI,
 					psi, &psi_p9_irq_ops);
-	} else {
-		prlog(PR_DEBUG,
-		      "PSI[0x%03x]: Interrupts sources registered for P9 DD1.x\n",
-		      psi->chip_id);
-		xive_register_hw_source(psi->interrupt, P9_PSI_NUM_IRQS,
-					12, psi->esb_mmio, XIVE_SRC_LSI,
-					psi, &psi_p9_dd1_irq_ops);
 	}
 }
 

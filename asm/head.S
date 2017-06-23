@@ -198,8 +198,8 @@ _exception:
 	mflr	%r6
 	stw	%r3,STACK_CR(%r1)
 	stw	%r4,STACK_XER(%r1)
-	stw	%r5,STACK_CTR(%r1)
-	stw	%r5,STACK_LR(%r1)
+	std	%r5,STACK_CTR(%r1)
+	std	%r6,STACK_LR(%r1)
 	mfspr	%r3,SPR_SRR0
 	mfspr	%r4,SPR_SRR1
 	mfspr	%r5,SPR_HSRR0
@@ -398,7 +398,7 @@ secondary_wait:
 	 */
 	LOAD_IMM32(%r3, boot_flag - __head)
 	add	%r3,%r3,%r30
-1:	smt_very_low
+1:	smt_lowest
 	lwz	%r0,0(%r3)
 	cmpdi	%r0,0
 	beq	1b
@@ -416,7 +416,7 @@ secondary_wait:
 1:
 	/* Now wait for cpu_secondary_start to be set */
 	LOAD_ADDR_FROM_TOC(%r3, cpu_secondary_start)
-1:	smt_very_low
+1:	smt_lowest
 	ld	%r0,0(%r3)
 	cmpdi	%r0,0
 	beq	1b
@@ -441,7 +441,7 @@ secondary_wait:
 
 	/* Not found... what to do ? set some global error ? */
 secondary_not_found:
-	smt_very_low
+	smt_lowest
 	b	.
 
 call_relocate:
@@ -655,7 +655,6 @@ cleanup_tlb:
 .global init_shared_sprs
 init_shared_sprs:
 	li	%r0,0
-	mtspr	SPR_SDR1, %r0
 	mtspr	SPR_AMOR, %r0
 
 	mfspr	%r3,SPR_PVR
@@ -676,18 +675,21 @@ init_shared_sprs:
 	b	9f
 
 1:	/* P7 */
+	mtspr	SPR_SDR1, %r0
 	/* TSCR: Value from pHyp */
 	LOAD_IMM32(%r3,0x880DE880)
 	mtspr	SPR_TSCR, %r3
 	b	9f
 
 2:	/* P7+ */
+	mtspr	SPR_SDR1, %r0
 	/* TSCR: Recommended value by HW folks */
 	LOAD_IMM32(%r3,0x88CDE880)
 	mtspr	SPR_TSCR, %r3
 	b	9f
 
 3:	/* P8E/P8 */
+	mtspr	SPR_SDR1, %r0
 	/* TSCR: Recommended value by HW folks */
 	LOAD_IMM32(%r3,0x8ACC6880)
 	mtspr	SPR_TSCR, %r3
@@ -723,6 +725,9 @@ init_shared_sprs:
 	b	9f
 
 4:	/* P9 */
+	/* TSCR: Recommended value by HW folks */
+	LOAD_IMM32(%r3,0x80287880)
+	mtspr	SPR_TSCR, %r3
 	/* HID0: Clear bit 5 (enable core recovery)
 	 *       Clear bit 4 (HILE)
 	 */

@@ -91,7 +91,9 @@ static inline bool opal_booting(void)
 	return !(debug_descriptor.state_flags & OPAL_BOOT_COMPLETE);
 }
 
-/* Console logging */
+/* Console logging
+ * Update console_get_level() if you add here
+ */
 #define PR_EMERG	0
 #define PR_ALERT	1
 #define PR_CRIT		2
@@ -212,9 +214,8 @@ extern void setup_reset_vector(void);
 extern void probe_p7ioc(void);
 extern void probe_phb3(void);
 extern void probe_phb4(void);
-extern int phb3_preload_capp_ucode(void);
 extern void phb3_preload_vpd(void);
-extern int phb4_preload_capp_ucode(void);
+extern int preload_capp_ucode(void);
 extern void phb4_preload_vpd(void);
 extern void probe_npu(void);
 extern void probe_npu2(void);
@@ -254,9 +255,12 @@ enum {
 extern void uart_set_console_policy(int policy);
 extern bool uart_enabled(void);
 
-/* OCC interrupt */
-extern void occ_interrupt(uint32_t chip_id);
+/* OCC interrupt for P8 */
+extern void occ_p8_interrupt(uint32_t chip_id);
 extern void occ_send_dummy_interrupt(void);
+
+/* OCC interrupt for P9 */
+extern void occ_p9_interrupt(uint32_t chip_id);
 
 /* OCC load support */
 extern void occ_poke_load_queue(void);
@@ -272,6 +276,7 @@ extern void occ_pnor_set_owner(enum pnor_owner owner);
 extern void prd_psi_interrupt(uint32_t proc);
 extern void prd_tmgt_interrupt(uint32_t proc);
 extern void prd_occ_reset(uint32_t proc);
+extern void prd_sbe_passthrough(uint32_t proc);
 extern void prd_init(void);
 extern void prd_register_reserved_memory(void);
 

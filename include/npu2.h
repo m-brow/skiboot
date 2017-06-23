@@ -35,6 +35,10 @@
 
 #define NPU2_LINKS_PER_CHIP 6
 
+/* Link flags */
+#define NPU2_DEV_PCI_LINKED	0x1
+#define NPU2_DEV_DL_RESET	0x2
+
 /* Return the stack (0-2) of a device */
 #define NPU2DEV_STACK(ndev) ((ndev)->index / 2)
 
@@ -53,17 +57,9 @@ struct npu2_bar {
 #define NPU2_BAR_FLAG_ENABLED0	0x0080
 #define NPU2_BAR_FLAG_ENABLED1  0x0100
 	uint32_t		flags;
-
-#define NPU2_BAR_TYPE_GLOBAL	0
-#define NPU2_BAR_TYPE_PHY	1
-#define NPU2_BAR_TYPE_NTL	2
-#define NPU2_BAR_TYPE_GENID	3
-#define NPU2_BAR_TYPE_MAX	4
-	uint32_t		type;
-	uint64_t		reg;
-	uint64_t		stack;
 	uint64_t		base;
 	uint64_t		size;
+	uint64_t		reg;
 };
 
 /* Rpresents a BAR that is exposed via the PCIe emulated
@@ -72,9 +68,7 @@ struct npu2_pcie_bar {
 #define NPU2_PCIE_BAR_FLAG_SIZE_HI	0x0020
 #define NPU2_PCIE_BAR_FLAG_TRAPPED	0x0040
 	uint32_t		flags;
-	struct npu2_bar		*npu2_bar;
-	uint64_t		base;
-	uint64_t		size;
+	struct npu2_bar		npu2_bar;
 };
 
 struct npu2;
@@ -99,7 +93,7 @@ struct npu2_dev {
 	struct phb		*phb;
 	struct pci_device	*pd;
 
-	int                     ntl_reset_done;
+	uint8_t			link_flags;
 
 	/* Vendor specific capability */
 	uint32_t		vendor_cap;
@@ -149,13 +143,14 @@ static inline struct npu2 *phb_to_npu2(struct phb *phb)
 	return container_of(phb, struct npu2, phb);
 }
 
-void npu2_write_4b(struct npu2 *p, uint64_t reg, uint64_t val);
-uint64_t npu2_read_4b(struct npu2 *p, uint64_t reg);
+void npu2_write_4b(struct npu2 *p, uint64_t reg, uint32_t val);
+uint32_t npu2_read_4b(struct npu2 *p, uint64_t reg);
 void npu2_write(struct npu2 *p, uint64_t reg, uint64_t val);
 uint64_t npu2_read(struct npu2 *p, uint64_t reg);
 void npu2_write_mask(struct npu2 *p, uint64_t reg, uint64_t val, uint64_t mask);
 int64_t npu2_dev_procedure(void *dev, struct pci_cfg_reg_filter *pcrf,
 			   uint32_t offset, uint32_t len, uint32_t *data,
 			   bool write);
-
+void npu2_set_link_flag(struct npu2_dev *ndev, uint8_t flag);
+extern int nv_zcal_nominal;
 #endif /* __NPU2_H */

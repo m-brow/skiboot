@@ -26,6 +26,11 @@
 #include <timebase.h>
 #include <device.h>
 #include <fsp-sysparam.h>
+#include <errorlog.h>
+
+DEFINE_LOG_ENTRY(OPAL_RC_CONSOLE_HANG, OPAL_PLATFORM_ERR_EVT, OPAL_CONSOLE,
+		 OPAL_PLATFORM_FIRMWARE,
+		 OPAL_PREDICTIVE_ERR_GENERAL, OPAL_NA);
 
 struct fsp_serbuf_hdr {
 	u16	partition_id;
@@ -145,7 +150,6 @@ static void fsp_pokemsg_reclaim(struct fsp_msg *msg)
 		if (fs->out_poke) {
 			if (fsp_queue_msg(fs->poke_msg, fsp_pokemsg_reclaim)) {
 				prerror("FSPCON: failed to queue poke msg\n");
-				fsp_freemsg(msg);
 			} else {
 				fs->out_poke = false;
 			}
@@ -288,11 +292,16 @@ static void fsp_open_vserial(struct fsp_msg *msg)
 		goto already_open;
 	}
 
-	fs->open = true;
-
 	fs->poke_msg = fsp_mkmsg(FSP_CMD_VSERIAL_OUT, 2,
 				 msg->data.words[0],
 				 msg->data.words[1] & 0xffff);
+	if (fs->poke_msg == NULL) {
+		prerror("FSPCON: Failed to allocate poke_msg\n");
+		unlock(&fsp_con_lock);
+		return;
+	}
+
+	fs->open = true;
 	fs->poke_msg->user_data = fs;
 
 	fs->in_buf->partition_id = fs->out_buf->partition_id = part_id;
@@ -612,7 +621,18 @@ static int64_t fsp_console_write(int64_t term_number, int64_t *length,
 	*length = written;
 	unlock(&fsp_con_lock);
 
-	return written ? OPAL_SUCCESS : OPAL_BUSY_EVENT;
+	if (written)
+		return OPAL_SUCCESS;
+
+	/*
+	 * FSP is still active but not reading console data. Hence
+	 * our console buffer became full. Most likely IPMI daemon
+	 * on FSP is buggy. Lets log error and return OPAL_HARDWARE
+	 * to payload (Linux).
+	 */
+	log_simple_error(&e_info(OPAL_RC_CONSOLE_HANG), "FSPCON: Console "
+			 "buffer is full, dropping console data\n");
+	return OPAL_HARDWARE;
 }
 
 static int64_t fsp_console_write_buffer_space(int64_t term_number,
@@ -640,7 +660,7 @@ static int64_t fsp_console_write_buffer_space(int64_t term_number,
 }
 
 static int64_t fsp_console_read(int64_t term_number, int64_t *length,
-				uint8_t *buffer __unused)
+				uint8_t *buffer)
 {
 	struct fsp_serial *fs;
 	struct fsp_serbuf_hdr *sb;

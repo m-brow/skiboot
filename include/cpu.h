@@ -43,11 +43,6 @@ enum cpu_thread_state {
 struct cpu_job;
 struct xive_cpu_state;
 
-enum cpu_wake_cause {
-	cpu_wake_on_job,
-	cpu_wake_on_dec,
-};
-
 struct cpu_thread {
 	uint32_t			pir;
 	uint32_t			server_no;
@@ -121,8 +116,7 @@ extern struct cpu_thread *boot_cpu;
 static inline void __nomcount cpu_relax(void)
 {
 	/* Relax a bit to give sibling threads some breathing space */
-	smt_low();
-	smt_very_low();
+	smt_lowest();
 	asm volatile("nop; nop; nop; nop;\n"
 		     "nop; nop; nop; nop;\n"
 		     "nop; nop; nop; nop;\n"
@@ -275,6 +269,7 @@ static inline void cpu_give_self_os(void)
 extern unsigned long __attrconst cpu_stack_bottom(unsigned int pir);
 extern unsigned long __attrconst cpu_stack_top(unsigned int pir);
 
-extern void cpu_idle(enum cpu_wake_cause wake_on);
+extern void cpu_idle_job(void);
+extern void cpu_idle_delay(unsigned long delay, unsigned long min_pm);
 
 #endif /* __CPU_H */

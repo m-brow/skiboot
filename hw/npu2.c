@@ -34,6 +34,8 @@
 #include <xscom.h>
 #include <bitutils.h>
 #include <chip.h>
+#include <phys-map.h>
+#include <nvram.h>
 
 /*
  * NPU2 BAR layout definition. We have 3 stacks and each of them
@@ -50,34 +52,11 @@
  * We need to access 4 SM registers in the same stack in order to
  * configure one particular BAR.
  */
-#define NPU2_DEFINE_BAR(t, n, s)					\
-	{ .flags         = 0,						\
-	  .type          = t,						\
-	  .reg           = NPU2_##n,					\
-	  .stack         = s,						\
-	  .base	         = 0ul,						\
-	  .size          = 0ul,						\
-	}
 
 #define VENDOR_CAP_START          0x80
 #define VENDOR_CAP_END	          0x90
 
 #define VENDOR_CAP_PCI_DEV_OFFSET 0x0d
-
-static struct npu2_bar npu2_bars[] = {
-	NPU2_DEFINE_BAR(NPU2_BAR_TYPE_GLOBAL,   PHY_BAR,   NPU2_STACK_STCK_2),
-	NPU2_DEFINE_BAR(NPU2_BAR_TYPE_PHY,	PHY_BAR,   NPU2_STACK_STCK_0),
-	NPU2_DEFINE_BAR(NPU2_BAR_TYPE_PHY,	PHY_BAR,   NPU2_STACK_STCK_1),
-	NPU2_DEFINE_BAR(NPU2_BAR_TYPE_NTL,	NTL0_BAR,  NPU2_STACK_STCK_0),
-	NPU2_DEFINE_BAR(NPU2_BAR_TYPE_NTL,	NTL1_BAR,  NPU2_STACK_STCK_0),
-	NPU2_DEFINE_BAR(NPU2_BAR_TYPE_NTL,	NTL0_BAR,  NPU2_STACK_STCK_1),
-	NPU2_DEFINE_BAR(NPU2_BAR_TYPE_NTL,	NTL1_BAR,  NPU2_STACK_STCK_1),
-	NPU2_DEFINE_BAR(NPU2_BAR_TYPE_NTL,	NTL0_BAR,  NPU2_STACK_STCK_2),
-	NPU2_DEFINE_BAR(NPU2_BAR_TYPE_NTL,	NTL1_BAR,  NPU2_STACK_STCK_2),
-	NPU2_DEFINE_BAR(NPU2_BAR_TYPE_GENID,	GENID_BAR, NPU2_STACK_STCK_0),
-	NPU2_DEFINE_BAR(NPU2_BAR_TYPE_GENID,	GENID_BAR, NPU2_STACK_STCK_1),
-	NPU2_DEFINE_BAR(NPU2_BAR_TYPE_GENID,	GENID_BAR, NPU2_STACK_STCK_2)
-};
 
 /*
  * We use the indirect method because it uses the same addresses as
@@ -110,14 +89,16 @@ static uint64_t npu2_scom_read(uint64_t gcid, uint64_t scom_base,
 	return val;
 }
 
-void npu2_write_4b(struct npu2 *p, uint64_t reg, uint64_t val)
+void npu2_write_4b(struct npu2 *p, uint64_t reg, uint32_t val)
 {
-	npu2_scom_write(p->chip_id, p->xscom_base, reg, NPU2_MISC_DA_LEN_4B, val);
+	npu2_scom_write(p->chip_id, p->xscom_base, reg, NPU2_MISC_DA_LEN_4B,
+			(uint64_t)val << 32);
 }
 
-uint64_t npu2_read_4b(struct npu2 *p, uint64_t reg)
+uint32_t npu2_read_4b(struct npu2 *p, uint64_t reg)
 {
-	return npu2_scom_read(p->chip_id, p->xscom_base, reg, NPU2_MISC_DA_LEN_4B);
+	return npu2_scom_read(p->chip_id, p->xscom_base, reg,
+			      NPU2_MISC_DA_LEN_4B) >> 32;
 }
 
 void npu2_write(struct npu2 *p, uint64_t reg, uint64_t val)
@@ -138,6 +119,14 @@ void npu2_write_mask(struct npu2 *p, uint64_t reg, uint64_t val, uint64_t mask)
 	new_val &= ~mask;
 	new_val |= val & mask;
 	npu2_scom_write(p->chip_id, p->xscom_base, reg, NPU2_MISC_DA_LEN_8B, new_val);
+}
+
+/* Set a specific flag in the vendor config space */
+void npu2_set_link_flag(struct npu2_dev *ndev, uint8_t flag)
+{
+	ndev->link_flags |= flag;
+	PCI_VIRT_CFG_INIT_RO(ndev->pvd, VENDOR_CAP_START +
+			     VENDOR_CAP_PCI_DEV_OFFSET, 1, ndev->link_flags);
 }
 
 static inline void npu2_ioda_sel(struct npu2 *p, uint32_t table,
@@ -165,6 +154,46 @@ static struct npu2_dev *npu2_bdf_to_dev(struct npu2 *p,
 	return NULL;
 }
 
+static void npu2_read_bar(struct npu2 *p, struct npu2_bar *bar)
+{
+	uint64_t reg, val;
+	int enabled;
+
+	reg = NPU2_REG_OFFSET(0, NPU2_BLOCK_SM_0, bar->reg);
+	val = npu2_read(p, reg);
+
+	switch (NPU2_REG(bar->reg)) {
+	case NPU2_PHY_BAR:
+		bar->base = GETFIELD(NPU2_PHY_BAR_ADDR, val) << 21;
+		enabled = GETFIELD(NPU2_PHY_BAR_ENABLE, val);
+
+		if (NPU2_REG_STACK(reg) == NPU2_STACK_STCK_2)
+			/* This is the global MMIO BAR */
+			bar->size = 0x1000000;
+		else
+			bar->size = 0x200000;
+		break;
+	case NPU2_NTL0_BAR:
+	case NPU2_NTL1_BAR:
+		bar->base = GETFIELD(NPU2_NTL_BAR_ADDR, val) << 17;
+		enabled = GETFIELD(NPU2_NTL_BAR_ENABLE, val);
+		bar->size = 0x20000;
+		break;
+	case NPU2_GENID_BAR:
+		bar->base = GETFIELD(NPU2_GENID_BAR_ADDR, val) << 17;
+		enabled = GETFIELD(NPU2_GENID_BAR_ENABLE, val);
+		bar->size = 0x20000;
+		break;
+	default:
+		bar->base = 0ul;
+		enabled = 0;
+		bar->size = 0;
+		break;
+	}
+
+	bar->flags = SETFIELD(NPU2_BAR_FLAG_ENABLED, bar->flags, enabled);
+}
+
 static void npu2_write_bar(struct npu2 *p,
 			   struct npu2_bar *bar,
 			   uint32_t gcid,
@@ -173,17 +202,17 @@ static void npu2_write_bar(struct npu2 *p,
 	uint64_t reg, val, enable = !!(bar->flags & NPU2_BAR_FLAG_ENABLED);
 	int block;
 
-	switch (bar->type) {
-	case NPU2_BAR_TYPE_GLOBAL:
-	case NPU2_BAR_TYPE_PHY:
+	switch (NPU2_REG(bar->reg)) {
+	case NPU2_PHY_BAR:
 		val = SETFIELD(NPU2_PHY_BAR_ADDR, 0ul, bar->base >> 21);
 		val = SETFIELD(NPU2_PHY_BAR_ENABLE, val, enable);
 		break;
-	case NPU2_BAR_TYPE_NTL:
+	case NPU2_NTL0_BAR:
+	case NPU2_NTL1_BAR:
 		val = SETFIELD(NPU2_NTL_BAR_ADDR, 0ul, bar->base >> 17);
 		val = SETFIELD(NPU2_NTL_BAR_ENABLE, val, enable);
 		break;
-	case NPU2_BAR_TYPE_GENID:
+	case NPU2_GENID_BAR:
 		val = SETFIELD(NPU2_GENID_BAR_ADDR, 0ul, bar->base >> 17);
 		val = SETFIELD(NPU2_GENID_BAR_ENABLE, val, enable);
 		break;
@@ -192,11 +221,11 @@ static void npu2_write_bar(struct npu2 *p,
 	}
 
 	for (block = NPU2_BLOCK_SM_0; block <= NPU2_BLOCK_SM_3; block++) {
-		reg = NPU2_REG_OFFSET(bar->stack, block, bar->reg);
+		reg = NPU2_REG_OFFSET(0, block, bar->reg);
 		if (p)
 			npu2_write(p, reg, val);
 		else
-			npu2_scom_write(gcid, scom, reg, val, NPU2_MISC_DA_LEN_8B);
+			npu2_scom_write(gcid, scom, reg, NPU2_MISC_DA_LEN_8B, val);
 	}
 }
 
@@ -224,8 +253,8 @@ static int64_t npu2_cfg_write_cmd(void *dev,
 	 * one GENID BAR, which is exposed via the first brick.
 	 */
 	enabled = !!(*data & PCI_CFG_CMD_MEM_EN);
-	ntl_npu_bar = ndev->bars[0].npu2_bar;
-	genid_npu_bar = ndev->bars[1].npu2_bar;
+	ntl_npu_bar = &ndev->bars[0].npu2_bar;
+	genid_npu_bar = &ndev->bars[1].npu2_bar;
 
 	ntl_npu_bar->flags = SETFIELD(NPU2_BAR_FLAG_ENABLED, ntl_npu_bar->flags, enabled);
 	npu2_write_bar(ndev->npu, ntl_npu_bar, 0, 0);
@@ -266,9 +295,9 @@ static int64_t npu2_cfg_read_bar(struct npu2_dev *dev __unused,
 		return OPAL_PARAMETER;
 
 	if (bar->flags & NPU2_PCIE_BAR_FLAG_SIZE_HI)
-		*data = bar->size >> 32;
+		*data = bar->npu2_bar.size >> 32;
 	else
-		*data = bar->size;
+		*data = bar->npu2_bar.size;
 	bar->flags &= ~(NPU2_PCIE_BAR_FLAG_TRAPPED | NPU2_PCIE_BAR_FLAG_SIZE_HI);
 
 	return OPAL_SUCCESS;
@@ -281,6 +310,7 @@ static int64_t npu2_cfg_write_bar(struct npu2_dev *dev,
 {
 	struct pci_virt_device *pvd = dev->pvd;
 	struct npu2_pcie_bar *bar = (struct npu2_pcie_bar *) pcrf->data;
+	struct npu2_bar old_bar, *npu2_bar = &bar->npu2_bar;
 	uint32_t pci_cmd;
 
 	if ((size != 4) ||
@@ -297,24 +327,28 @@ static int64_t npu2_cfg_write_bar(struct npu2_dev *dev,
 	}
 
 	if (offset == pcrf->start) {
-		bar->base &= 0xffffffff00000000;
-		bar->base |= (data & 0xfffffff0);
+		npu2_bar->base &= 0xffffffff00000000;
+		npu2_bar->base |= (data & 0xfffffff0);
 	} else {
-		bar->base &= 0x00000000ffffffff;
-		bar->base |= ((uint64_t)data << 32);
+		npu2_bar->base &= 0x00000000ffffffff;
+		npu2_bar->base |= ((uint64_t)data << 32);
 
 		PCI_VIRT_CFG_NORMAL_RD(pvd, PCI_CFG_CMD, 4, &pci_cmd);
 
-		if (bar->npu2_bar->type == NPU2_BAR_TYPE_GENID && NPU2DEV_BRICK(dev))
-			bar->base -= 0x10000;
+		if (NPU2_REG(npu2_bar->reg) == NPU2_GENID_BAR && NPU2DEV_BRICK(dev))
+			npu2_bar->base -= 0x10000;
+
+		old_bar.reg = npu2_bar->reg;
+		npu2_read_bar(dev->npu, &old_bar);
 
 		/* Only allow changing the base address if the BAR is not enabled */
-		if ((bar->npu2_bar->flags & NPU2_BAR_FLAG_ENABLED) &&
-		    (bar->npu2_bar->base != bar->base))
+		if ((npu2_bar->flags & NPU2_BAR_FLAG_ENABLED) &&
+		    (npu2_bar->base != old_bar.base)) {
+			npu2_bar->base = old_bar.base;
 			return OPAL_HARDWARE;
+		}
 
-		bar->npu2_bar->base = bar->base;
-		npu2_write_bar(dev->npu, bar->npu2_bar, 0, 0);
+		npu2_write_bar(dev->npu, &bar->npu2_bar, 0, 0);
 	}
 
 	/* To update the config cache */
@@ -416,8 +450,7 @@ static void npu2_dev_bind_pci_dev(struct npu2_dev *dev)
 		if (dev->pd) {
 			dev->phb = phb;
 			/* Found the device, set the bit in config space */
-			PCI_VIRT_CFG_INIT_RO(dev->pvd, VENDOR_CAP_START +
-				VENDOR_CAP_PCI_DEV_OFFSET, 1, 0x01);
+			npu2_set_link_flag(dev, NPU2_DEV_PCI_LINKED);
 			return;
 		}
 	}
@@ -489,68 +522,42 @@ static struct dt_node *npu2_create_memory_dn(uint64_t addr, uint64_t size)
 	return mem;
 }
 
-static void npu2_dn_fixup_gmb(struct dt_node *pd_dn, uint64_t gmb)
+/* There are potentially multiple links per GPU, so lookup the GPU memory based
+ * on bdfn. */
+static void npu2_get_gpu_base(struct npu2_dev *ndev, uint64_t *addr, uint64_t *size)
 {
-	uint64_t sel, gpu_base, gpu_size, gta;
+	int group;
+
+	group = (ndev->bdfn >> 3) & 0x1f;
+	phys_map_get(ndev->npu->chip_id, GPU_MEM, group, addr, size);
+}
+
+static void npu2_dn_fixup_gmb(struct dt_node *pd_dn, struct npu2_dev *ndev)
+{
+	uint64_t gpu_base, gpu_size, gta;
 	struct dt_node *mem_dn;
 
-	sel = GETFIELD(NPU2_MEM_BAR_SEL_MEM, gmb);
-	switch (sel) {
-	case 0:
-		/* BAR disabled */
-		return;
-	case 4:
-		gpu_base = 0;
-		break;
-	case 5:
-		gpu_base = 1UL << 49;
-		break;
-	case 6:
-		gpu_base = 2UL << 49;
-		break;
-	default:
-		prlog(PR_ERR, "unhandled NPU2_MEM_BAR_SEL_MEM 0x%llx\n", sel);
-		return;
-	}
-
-	gpu_base |= GETFIELD(NPU2_MEM_BAR_GROUP, gmb) << 43;
-	gpu_base |= GETFIELD(NPU2_MEM_BAR_CHIP, gmb) << 41;
-	gpu_base |= GETFIELD(NPU2_MEM_BAR_ADDR, gmb) << 30;
-	gpu_size = GETFIELD(NPU2_MEM_BAR_BAR_SIZE, gmb) << 32;
-
+	npu2_get_gpu_base(ndev, &gpu_base, &gpu_size);
 	mem_dn = npu2_create_memory_dn(gpu_base, gpu_size);
 	assert(mem_dn);
 	dt_add_property_cells(pd_dn, "memory-region", mem_dn->phandle);
 
-	gta  = ((gpu_base >> 42) & 0x1) << 41;
-	gta |= ((gpu_base >> 45) & 0x3) << 42;
+	/* Coral mode address compression. This is documented in Figure 3.5
+	 * "P9->GPU RA Compression (Coral) of the NPU2 workbook". */
+	gta  = ((gpu_base >> 42) & 0x1) << 42;
+	gta |= ((gpu_base >> 45) & 0x3) << 43;
 	gta |= ((gpu_base >> 49) & 0x3) << 45;
 	gta |= gpu_base & ((1UL << 43) - 1);
 
 	dt_add_property_u64s(pd_dn, "ibm,device-tgt-addr", gta);
 }
 
-/* Used by the below function to assign GPU base addresses */
-static uint64_t npu2_group_addr[NPU2_LINKS_PER_CHIP] = {0};
-static uint64_t npu2_base_addr;
-static int npu2_assign_gmb(struct phb *phb, struct pci_device *pd,
-			 void *data __unused)
+static int npu2_assign_gmb(struct npu2_dev *ndev)
 {
-	struct npu2 *p = phb_to_npu2(phb);
-	struct npu2_dev *ndev;
-	int group, peers, mode;
+	struct npu2 *p = ndev->npu;
+	int peers, mode;
 	uint32_t bdfn;
-	uint64_t reg, gmb, old_val;
-
-	ndev = npu2_bdf_to_dev(p, pd->bdfn);
-	assert(ndev);
-
-	/* Assign GPU memory base addresses. The current strategy is
-	 * to work backwards from maximum memory assigning 128GB per
-	 * GPU as that is the minimum alignment requirements. So we
-	 * need to count the number of GPUs and give each a base
-	 * address then configure the hashing based on the number of
-	 * links */
+	uint64_t base, size, reg, gmb, old_val;
 
 	/* Need to work out number of link peers. This amount to
 	 * working out the maximum function number. So work start at
@@ -560,31 +567,21 @@ static int npu2_assign_gmb(struct phb *phb, struct pci_device *pd,
 	     (bdfn & 0x7) != 0x7; bdfn = (bdfn & ~0x7) | ((bdfn & 0x7) - 1))
 		if (npu2_bdf_to_dev(p, bdfn))
 			break;
-
 	peers = bdfn & 0x7;
-	group = (bdfn >> 3) & 0x1f;
 
-	/* These should never happen but would lead to memory
-	 * corruption if they do so best to check. */
-	assert(peers != 0x7);
-	assert(group < NPU2_LINKS_PER_CHIP);
+	npu2_get_gpu_base(ndev, &base, &size);
 
-	if (!npu2_group_addr[group]) {
-		/* Assign new base address */
-		npu2_base_addr -= 128;
-		npu2_group_addr[group] = npu2_base_addr;
-	}
-
+	/* Base address is in GB */
+	base >>= 30;
 	gmb = SETFIELD(NPU2_MEM_BAR_SEL_MEM, 0ULL, 4);
-	gmb = SETFIELD(PPC_BITMASK(2,21), gmb, npu2_group_addr[group]);
+	gmb = SETFIELD(NPU2_MEM_BAR_NODE_ADDR, gmb, base);
+	gmb = SETFIELD(NPU2_MEM_BAR_GROUP | NPU2_MEM_BAR_CHIP, gmb, p->chip_id);
 	gmb = SETFIELD(NPU2_MEM_BAR_POISON, gmb, 1);
 	gmb = SETFIELD(NPU2_MEM_BAR_GRANULE, gmb, 0);
 
-	/* We don't know how much memory the GPU has but if we
-	 * have to align it to 128GB boundaries we may as well
-	 * just pass the whole aperture through at this
-	 * point. */
-	gmb = SETFIELD(NPU2_MEM_BAR_BAR_SIZE, gmb, 7);
+	/* We don't know how much memory the GPU has, so we may as well just
+	 * pass the whole aperture through at this point. */
+	gmb = SETFIELD(NPU2_MEM_BAR_BAR_SIZE, gmb, ilog2(size >> 30));
 
 	switch (peers) {
 	case 0:
@@ -641,23 +638,14 @@ static int npu2_dn_fixup(struct phb *phb,
 {
 	struct npu2 *p = phb_to_npu2(phb);
 	struct npu2_dev *dev;
-	uint64_t reg, gmb;
 
 	dev = npu2_bdf_to_dev(p, pd->bdfn);
 	assert(dev);
 	if (dev->phb || dev->pd)
 		return 0;
 
-	reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_0 + NPU2DEV_STACK(dev),
-			      NPU2_BLOCK_SM_0,
-			      NPU2_GPU0_MEM_BAR);
-	gmb = npu2_read(p, reg);
-	if (NPU2DEV_BRICK(dev))
-		gmb <<= 32;
-	else
-		gmb &= 0xffffffff00000000;
-
-	npu2_dn_fixup_gmb(pd->dn, gmb);
+	npu2_assign_gmb(dev);
+	npu2_dn_fixup_gmb(pd->dn, dev);
 	dt_add_property_cells(pd->dn, "ibm,nvlink", dev->dt_node->phandle);
 
 	/* NPU devices require a slot location to associate with GPUs */
@@ -694,11 +682,6 @@ static int npu2_dn_fixup(struct phb *phb,
 
 static void npu2_phb_final_fixup(struct phb *phb)
 {
-	struct npu2 *p = phb_to_npu2(phb);
-
-	/* Start allocating GPU memory from 4TB down. */
-	npu2_base_addr = (p->chip_id << 21) | 4*1024;
-	pci_walk_dev(phb, NULL, npu2_assign_gmb, NULL);
 	pci_walk_dev(phb, NULL, npu2_dn_fixup, NULL);
 }
 
@@ -757,13 +740,55 @@ static int64_t npu2_ioda_reset(struct phb *phb, bool purge)
 
 static void npu2_hw_init(struct npu2 *p)
 {
-	uint64_t val;
+	int i;
+	uint64_t val, size, addr, gpu_min_addr, gpu_max_addr, total_size;
 
 	npu2_ioda_reset(&p->phb, false);
 
 	/* Enable XTS retry mode */
 	val = npu2_read(p, NPU2_XTS_CFG);
 	npu2_write(p, NPU2_XTS_CFG, val | NPU2_XTS_CFG_MMIOSD | NPU2_XTS_CFG_TRY_ATR_RO);
+
+	/* Init memory cache directory (MCD) registers. */
+	phys_map_get(p->chip_id, GPU_MEM, NPU2_LINKS_PER_CHIP - 1,
+			&gpu_min_addr, NULL);
+	phys_map_get(p->chip_id, GPU_MEM, 0, &gpu_max_addr, &size);
+	gpu_max_addr += size;
+
+	/* We assume GPU memory is contiguous from the first possible GPU to the
+	 * last and that the size is the same so best to check that. */
+	for (i = 0; i < NPU2_LINKS_PER_CHIP; i++) {
+		uint64_t tmp;
+		phys_map_get(p->chip_id, GPU_MEM, i, &addr, &tmp);
+		assert((addr >= gpu_min_addr) && (addr + tmp <= gpu_max_addr));
+		assert(tmp == size);
+	}
+
+	/* We have two MCDs, so if neccessary we can split the region covered
+	 * across both if total_size is not a power of two. */
+	total_size = gpu_max_addr - gpu_min_addr;
+	size = 1ull << ilog2(total_size);
+
+	/* Allocate the biggest chunk first as we assume gpu_max_addr has the
+	 * highest alignment. */
+	addr = gpu_max_addr - size;
+	val = PPC_BIT(0);
+	val = SETFIELD(PPC_BITMASK(13, 29), val, (size >> 25) - 1);
+	val = SETFIELD(PPC_BITMASK(33, 63), val, addr >> 25);
+	xscom_write(p->chip_id, MCD0_BANK0_CN3, val);
+	total_size -= size;
+	if (total_size) {
+	/* total_size was not a power of two, but the remainder should
+	 * be if all GPUs were assigned the same size. */
+		assert(is_pow2(total_size));
+		size = 1ull << ilog2(total_size);
+		addr -= size;
+		assert(addr <= gpu_min_addr);
+		val = PPC_BIT(0);
+		val = SETFIELD(PPC_BITMASK(13, 29), val, (size >> 25) - 1);
+		val = SETFIELD(PPC_BITMASK(33, 63), val, addr >> 25);
+		xscom_write(p->chip_id, MCD1_BANK0_CN3, val);
+	}
 }
 
 static int64_t npu2_map_pe_dma_window_real(struct phb *phb,
@@ -1089,15 +1114,31 @@ static const struct phb_ops npu_ops = {
 	.tce_kill		= npu2_tce_kill,
 };
 
-static void assign_mmio_bars(uint32_t gcid,
-			     uint32_t scom)
+static void assign_mmio_bars(uint64_t gcid, uint32_t scom, uint64_t reg[2], uint64_t mm_win[2])
 {
 	uint64_t mem_start;
-	struct npu2_bar *bar;
 	uint32_t i;
+	struct npu2_bar *bar;
+	struct npu2_bar npu2_bars[] = {
+		{ .reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_2, 0,   NPU2_PHY_BAR), .size = 0x1000000,
+		  .flags = NPU2_BAR_FLAG_ENABLED },
+		{ .reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_0, 0,   NPU2_PHY_BAR), .size =  0x200000,
+		  .flags = NPU2_BAR_FLAG_ENABLED },
+		{ .reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_1, 0,   NPU2_PHY_BAR), .size =  0x200000,
+		  .flags = NPU2_BAR_FLAG_ENABLED },
+		{ .reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_0, 0,  NPU2_NTL0_BAR), .size =   0x20000 },
+		{ .reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_0, 0,  NPU2_NTL1_BAR), .size =   0x20000 },
+		{ .reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_1, 0,  NPU2_NTL0_BAR), .size =   0x20000 },
+		{ .reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_1, 0,  NPU2_NTL1_BAR), .size =   0x20000 },
+		{ .reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_2, 0,  NPU2_NTL0_BAR), .size =   0x20000 },
+		{ .reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_2, 0,  NPU2_NTL1_BAR), .size =   0x20000 },
+		{ .reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_0, 0, NPU2_GENID_BAR), .size =   0x20000 },
+		{ .reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_1, 0, NPU2_GENID_BAR), .size =   0x20000 },
+		{ .reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_2, 0, NPU2_GENID_BAR), .size =   0x20000 },
+	};
 
 	mem_start = 0x6030200000000;
-	mem_start |= gcid << 21;
+	mem_start |= gcid << PPC_BITLSHIFT(21);
 
 	/*
 	 * We're going to assign the BARs in reversed order according
@@ -1122,31 +1163,21 @@ static void assign_mmio_bars(uint32_t gcid,
 	 */
 	for (i = 0; i < ARRAY_SIZE(npu2_bars); i++) {
 		bar = &npu2_bars[i];
-		switch (bar->type) {
-		case NPU2_BAR_TYPE_GLOBAL:
-			bar->flags |= NPU2_BAR_FLAG_ENABLED;
-			bar->size = 0x1000000;
-			break;
-		case NPU2_BAR_TYPE_PHY:
-			bar->flags |= NPU2_BAR_FLAG_ENABLED;
-			bar->size = 0x200000;
-			break;
-		case NPU2_BAR_TYPE_NTL:
-			bar->flags &= ~NPU2_BAR_FLAG_ENABLED;
-			bar->size = 0x20000;
-			break;
-		case NPU2_BAR_TYPE_GENID:
-			bar->flags &= ~NPU2_BAR_FLAG_ENABLED;
-			bar->size = 0x20000;
-			break;
-		default:
-			bar->size = 0ul;
-		}
-
 		bar->base = mem_start;
 		mem_start += bar->size;
 		npu2_write_bar(NULL, bar, gcid, scom);
 	}
+
+	/* Global MMIO BAR */
+	reg[0] = npu2_bars[0].base;
+	reg[1] = npu2_bars[0].size;
+
+	/* NTL and GENID BARs are exposed to kernel via the mm
+	 * window */
+	mm_win[0] = npu2_bars[3].base;
+	mm_win[1] = npu2_bars[ARRAY_SIZE(npu2_bars) - 1].base +
+		    npu2_bars[ARRAY_SIZE(npu2_bars) - 1].size -
+		    mm_win[0];
 }
 
 /*
@@ -1156,6 +1187,7 @@ static void assign_mmio_bars(uint32_t gcid,
  */
 static void npu2_probe_phb(struct dt_node *dn)
 {
+	struct proc_chip *proc_chip;
 	struct dt_node *np;
 	uint32_t gcid, scom, index, phb_index, links;
 	uint64_t reg[2], mm_win[2];
@@ -1164,6 +1196,12 @@ static void npu2_probe_phb(struct dt_node *dn)
 	/* Retrieve chip id */
 	path = dt_get_path(dn);
 	gcid = dt_get_chip_id(dn);
+	assert(proc_chip = get_chip(gcid));
+	if ((proc_chip->ec_level & 0xf0) != 0x10) {
+		prerror("NPU2: unsupported ec level on Chip 0x%x!\n", gcid);
+		return;
+	}
+
 	index = dt_prop_get_u32(dn, "ibm,npu-index");
 	phb_index = dt_prop_get_u32(dn, "ibm,phb-index");
 	links = dt_prop_get_u32(dn, "ibm,npu-links");
@@ -1176,22 +1214,13 @@ static void npu2_probe_phb(struct dt_node *dn)
 	prlog(PR_INFO, "   SCOM Base:  %08x\n", scom);
 
 	/* Reassign the BARs */
-	assign_mmio_bars(gcid, scom);
+	assign_mmio_bars(gcid, scom, reg, mm_win);
 
-	/* Global MMIO BAR */
-	reg[0] = npu2_bars[0].base;
-	reg[1] = npu2_bars[0].size;
 	if (reg[0] && reg[1])
 		prlog(PR_INFO, "   Global MMIO BAR:  %016llx (%lldMB)\n",
 		      reg[0], reg[1] >> 20);
 	else
 		prlog(PR_ERR, "    Global MMIO BAR: Disabled\n");
-
-	/* NTL and GENID BARs are exposed to kernel */
-	mm_win[0] = npu2_bars[3].base;
-	mm_win[1] = npu2_bars[ARRAY_SIZE(npu2_bars) - 1].base +
-		    npu2_bars[ARRAY_SIZE(npu2_bars) - 1].size -
-		    mm_win[0];
 
 	/* Populate PCI root device node */
 	np = dt_new_addr(dt_root, "pciex", reg[0]);
@@ -1209,6 +1238,7 @@ static void npu2_probe_phb(struct dt_node *dn)
 	dt_add_property_cells(np, "ibm,npcq", dn->phandle);
 	dt_add_property_cells(np, "ibm,links", links);
 	dt_add_property(np, "ibm,mmio-window", mm_win, sizeof(mm_win));
+	dt_add_property_cells(np, "ibm,phb-diag-data-size", 0);
 }
 
 static uint32_t npu2_populate_pcie_cap(struct npu2_dev *dev,
@@ -1351,9 +1381,9 @@ static void npu2_populate_cfg(struct npu2_dev *dev)
 	/* 0x10/14 - BAR#0, NTL BAR */
 	bar = &dev->bars[0];
 	PCI_VIRT_CFG_INIT(pvd, PCI_CFG_BAR0, 4,
-			  (bar->base & 0xfffffff0) | (bar->flags & 0xF),
+			  (bar->npu2_bar.base & 0xfffffff0) | (bar->flags & 0xF),
 			  0x0000000f, 0x00000000);
-	PCI_VIRT_CFG_INIT(pvd, PCI_CFG_BAR1, 4, (bar->base >> 32),
+	PCI_VIRT_CFG_INIT(pvd, PCI_CFG_BAR1, 4, (bar->npu2_bar.base >> 32),
 			  0x00000000, 0x00000000);
 	pci_virt_add_filter(pvd, PCI_CFG_BAR0, 8,
 			    PCI_REG_FLAG_READ | PCI_REG_FLAG_WRITE,
@@ -1361,10 +1391,17 @@ static void npu2_populate_cfg(struct npu2_dev *dev)
 
 	/* 0x18/1c - BAR#1, GENID BAR */
 	bar = &dev->bars[1];
-	PCI_VIRT_CFG_INIT(pvd, PCI_CFG_BAR2, 4, (bar->base & 0xfffffff0) |
-			  (bar->flags & 0xF),
-			  0x0000000f, 0x00000000);
-	PCI_VIRT_CFG_INIT(pvd, PCI_CFG_BAR3, 4, (bar->base >> 32), 0x00000000,
+	if (NPU2DEV_BRICK(dev) == 0)
+		PCI_VIRT_CFG_INIT(pvd, PCI_CFG_BAR2, 4, (bar->npu2_bar.base & 0xfffffff0) |
+				  (bar->flags & 0xF),
+				  0x0000000f, 0x00000000);
+	else
+		/* Brick 1 gets the upper portion of the generation id register */
+		PCI_VIRT_CFG_INIT(pvd, PCI_CFG_BAR2, 4, ((bar->npu2_bar.base + 0x10000) & 0xfffffff0) |
+				  (bar->flags & 0xF),
+				  0x0000000f, 0x00000000);
+
+	PCI_VIRT_CFG_INIT(pvd, PCI_CFG_BAR3, 4, (bar->npu2_bar.base >> 32), 0x00000000,
 			  0x00000000);
 	pci_virt_add_filter(pvd, PCI_CFG_BAR2, 8,
 			    PCI_REG_FLAG_READ | PCI_REG_FLAG_WRITE,
@@ -1434,6 +1471,7 @@ static void npu2_populate_devices(struct npu2 *p,
 	p->phb.scan_map = 0;
 	dt_for_each_compatible(npu2_dn, link, "ibm,npu-link") {
 		uint32_t group_id;
+		struct npu2_bar *npu2_bar;
 
 		dev = &p->devices[index];
 		dev->npu = p;
@@ -1451,16 +1489,29 @@ static void npu2_populate_devices(struct npu2 *p,
 		dev->pl_xscom_base = dt_prop_get_u64(link, "ibm,npu-phy");
 		dev->lane_mask = dt_prop_get_u32(link, "ibm,npu-lane-mask");
 
-		/* Populate BARs. BAR0/1 is the NTL bar. */
-		dev->bars[0].npu2_bar = &npu2_bars[3 + dev->index];
-		dev->bars[0].base = dev->bars[0].npu2_bar->base;
-		dev->bars[0].size = dev->bars[0].npu2_bar->size;
+		/* Populate BARs. BAR0/1 is the NTL bar. We initialise
+		 * it from the HW. */
+		npu2_bar = &dev->bars[0].npu2_bar;
+		if (NPU2DEV_BRICK(dev) == 0)
+			/* Leave the block as 0 - the read/write bar
+			 * functions fill it in */
+			npu2_bar->reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_0 + NPU2DEV_STACK(dev), 0, NPU2_NTL0_BAR);
+		else
+			npu2_bar->reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_0 + NPU2DEV_STACK(dev), 0, NPU2_NTL1_BAR);
+
+		npu2_read_bar(p, npu2_bar);
 		dev->bars[0].flags = PCI_CFG_BAR_TYPE_MEM | PCI_CFG_BAR_MEM64;
 
 		/* BAR2/3 is the GENID bar. */
-		dev->bars[1].npu2_bar = &npu2_bars[9 + dev->index / 2];
-		dev->bars[1].base = dev->bars[1].npu2_bar->base + (NPU2DEV_BRICK(dev) * 0x10000);
-		dev->bars[1].size = 0x10000;
+		npu2_bar = &dev->bars[1].npu2_bar;
+		npu2_bar->reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_0 + NPU2DEV_STACK(dev), 0, NPU2_GENID_BAR);
+		npu2_read_bar(p, npu2_bar);
+
+		/* The GENID is a single physical BAR that we split
+		 * for each emulated device */
+		npu2_bar->size = 0x10000;
+		if (NPU2DEV_BRICK(dev))
+			npu2_bar->base += 0x10000;
 		dev->bars[1].flags = PCI_CFG_BAR_TYPE_MEM | PCI_CFG_BAR_MEM64;
 
 		/* Initialize PCI virtual device */
@@ -1538,7 +1589,6 @@ static void npu2_create_phb(struct dt_node *dn)
 	p->chip_id = dt_prop_get_u32(dn, "ibm,chip-id");
 	p->xscom_base = dt_prop_get_u32(dn, "ibm,xscom-base");
 	p->total_devices = links;
-
 	p->regs = (void *)dt_get_address(dn, 0, NULL);
 
 	prop = dt_require_property(dn, "ibm,mmio-window", -1);
@@ -1580,6 +1630,14 @@ static void npu2_create_phb(struct dt_node *dn)
 void probe_npu2(void)
 {
 	struct dt_node *np;
+	const char *zcal;
+
+	/* Check for a zcal override */
+	zcal = nvram_query("nv_zcal_override");
+	if (zcal) {
+		nv_zcal_nominal = atoi(zcal);
+		prlog(PR_WARNING, "NPU2: Using ZCAL impedance override = %d\n", nv_zcal_nominal);
+	}
 
 	/* Scan NPU XSCOM nodes */
 	dt_for_each_compatible(dt_root, np, "ibm,power9-npu")
@@ -1680,8 +1738,10 @@ static int64_t opal_npu_init_context(uint64_t phb_id, int pasid, uint64_t msr,
 			       !!(msr & MSR_HV));
 	xts_bdf_pid = SETFIELD(NPU2_XTS_PID_MAP_MSR_PR, xts_bdf_pid,
 			       !!(msr & MSR_PR));
-	xts_bdf_pid = SETFIELD(NPU2_XTS_PID_MAP_MSR_SF, xts_bdf_pid,
-			       !!(msr & MSR_SF));
+
+	/* We don't support anything other than 64-bit so we can safely hardcode
+	 * it here */
+	xts_bdf_pid = SETFIELD(NPU2_XTS_PID_MAP_MSR_SF, xts_bdf_pid, 1);
 
 	/* Finally set the PID/PASID */
 	xts_bdf_pid = SETFIELD(NPU2_XTS_PID_MAP_PASID, xts_bdf_pid, pasid);
@@ -1766,11 +1826,11 @@ static int opal_npu_map_lpar(uint64_t phb_id, uint64_t bdf, uint64_t lparid,
 
 	/* Find any existing entries and update them */
 	xts_bdf_lpar = SETFIELD(NPU2_XTS_BDF_MAP_VALID, 0UL, 1);
-	xts_bdf_lpar = SETFIELD(NPU2_XTS_BDF_MAP_LPARID, xts_bdf_lpar, lparid);
+	xts_bdf_lpar = SETFIELD(NPU2_XTS_BDF_MAP_BDF, xts_bdf_lpar, bdf);
 	id = npu_table_search(p, NPU2_XTS_BDF_MAP, 8, NPU2_XTS_BDF_MAP_SIZE,
 			      &xts_bdf_lpar,
 			      NPU2_XTS_BDF_MAP_VALID |
-			      NPU2_XTS_BDF_MAP_LPARID);
+			      NPU2_XTS_BDF_MAP_BDF);
 	if (id < 0) {
 		/* No existing mapping found, find space for a new one */
 		xts_bdf_lpar = 0;

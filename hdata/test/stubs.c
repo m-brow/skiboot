@@ -23,8 +23,6 @@
 
 #include "../../ccan/list/list.c"
 
-unsigned long top_of_ram = 16ULL * 1024 * 1024 * 1024;
-
 void _prlog(int log_level __attribute__((unused)), const char* fmt, ...) __attribute__((format (printf, 2, 3)));
 
 #ifndef pr_fmt
@@ -34,12 +32,12 @@ void _prlog(int log_level __attribute__((unused)), const char* fmt, ...) __attri
 
 void _prlog(int log_level __attribute__((unused)), const char* fmt, ...)
 {
-        va_list ap;
+	va_list ap;
 
-        va_start(ap, fmt);
-        if (log_level < 7)
+	va_start(ap, fmt);
+	if (log_level <= 7)
 		vfprintf(stderr, fmt, ap);
-        va_end(ap);
+	va_end(ap);
 }
 
 /*
@@ -99,6 +97,24 @@ STUB(op_display);
 STUB(fsp_preload_lid);
 STUB(fsp_wait_lid_loaded);
 STUB(fsp_adjust_lid_side);
-STUB(mem_reserve_hw);
-STUB(early_uart_init);
 STUB(backtrace);
+
+/* Add HW specific stubs here */
+static bool true_stub(void) { return true; }
+static bool false_stub(void) { return false; }
+
+#define TRUE_STUB(fnname) \
+	void fnname(void) __attribute__((weak, alias ("true_stub")))
+#define FALSE_STUB(fnname) \
+	void fnname(void) __attribute__((weak, alias ("false_stub")))
+#define NOOP_STUB FALSE_STUB
+
+TRUE_STUB(lock_held_by_me);
+NOOP_STUB(lock);
+NOOP_STUB(unlock);
+NOOP_STUB(early_uart_init);
+NOOP_STUB(mem_reserve_fw);
+NOOP_STUB(mem_reserve_hwbuf);
+NOOP_STUB(add_chip_dev_associativity);
+NOOP_STUB(enable_mambo_console);
+

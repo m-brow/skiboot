@@ -24,6 +24,11 @@ uint64_t npu2_read(struct npu2 *p, uint64_t reg);
 void npu2_write(struct npu2 *p, uint64_t reg, uint64_t val);
 void npu2_write_mask(struct npu2 *p, uint64_t reg, uint64_t val, uint64_t mask);
 
+/* These aren't really NPU specific registers but we initialise them in NPU
+ * code */
+#define MCD0_BANK0_CN3 0x301100d
+#define MCD1_BANK0_CN3 0x301140d
+
 #define NPU2_REG_OFFSET(stack, block, offset) \
 	(((stack) << 20) | ((block) << 16) | (offset))
 
@@ -38,6 +43,10 @@ void npu2_write_mask(struct npu2 *p, uint64_t reg, uint64_t val, uint64_t mask);
 #define NPU2_DL_REG_OFFSET(ndev, offset)	\
 	NPU2_REG_OFFSET(((ndev)->index >> 1),				\
 			8 + ((ndev)->index % 2)*2, offset)
+
+/* Get the offset for this register */
+#define NPU2_REG(reg) \
+	((reg) & 0xffff)
 
 /* Get the stack number for this register */
 #define NPU2_REG_STACK(reg) \
@@ -95,7 +104,8 @@ void npu2_write_mask(struct npu2 *p, uint64_t reg, uint64_t val, uint64_t mask);
 #define   NPU2_MEM_BAR_SEL_MEM			PPC_BITMASK(0,2)
 #define   NPU2_MEM_BAR_GROUP			PPC_BITMASK(3,6)
 #define   NPU2_MEM_BAR_CHIP			PPC_BITMASK(7,9)
-#define   NPU2_MEM_BAR_ADDR			PPC_BITMASK(10,21)
+#define   NPU2_MEM_BAR_NODE_ADDR		PPC_BITMASK(10,21)
+#define   NPU2_MEM_BAR_ADDR			PPC_BITMASK(0,21)
 #define   NPU2_MEM_BAR_POISON			PPC_BIT(22)
 #define   NPU2_MEM_BAR_GRANULE			PPC_BIT(23)
 #define   NPU2_MEM_BAR_BAR_SIZE			PPC_BITMASK(24,27)
@@ -105,12 +115,14 @@ void npu2_write_mask(struct npu2 *p, uint64_t reg, uint64_t val, uint64_t mask);
 #define   NPU2_PHY_BAR_ENABLE			PPC_BIT(0)
 #define   NPU2_PHY_BAR_GROUP			PPC_BITMASK(3,6)
 #define   NPU2_PHY_BAR_CHIP			PPC_BITMASK(7,9)
-#define   NPU2_PHY_BAR_ADDR			PPC_BITMASK(10,30)
+#define   NPU2_PHY_BAR_NODE_ADDR		PPC_BITMASK(10,30)
+#define   NPU2_PHY_BAR_ADDR			PPC_BITMASK(3,30)
 #define NPU2_GENID_BAR				0x038
 #define   NPU2_GENID_BAR_ENABLE			PPC_BIT(0)
 #define   NPU2_GENID_BAR_GROUP			PPC_BITMASK(3,6)
 #define   NPU2_GENID_BAR_CHIP			PPC_BITMASK(7,9)
-#define   NPU2_GENID_BAR_ADDR			PPC_BITMASK(10,34)
+#define   NPU2_GENID_BAR_NODE_ADDR		PPC_BITMASK(10,34)
+#define   NPU2_GENID_BAR_ADDR			PPC_BITMASK(3,34)
 #define NPU2_LOW_WATER_MARKS			0x040
 #define NPU2_HIGH_WATER_MARKS			0x048
 #define NPU2_RELAXED_ORDERING_CFG0		0x050
@@ -121,7 +133,8 @@ void npu2_write_mask(struct npu2 *p, uint64_t reg, uint64_t val, uint64_t mask);
 #define   NPU2_NTL_BAR_ENABLE			PPC_BIT(0)
 #define   NPU2_NTL_BAR_GROUP			PPC_BITMASK(3,6)
 #define   NPU2_NTL_BAR_CHIP			PPC_BITMASK(7,9)
-#define   NPU2_NTL_BAR_ADDR			PPC_BITMASK(10,34)
+#define   NPU2_NTL_BAR_NODE_ADDR		PPC_BITMASK(10,34)
+#define   NPU2_NTL_BAR_ADDR			PPC_BITMASK(3,34)
 #define NPU2_PERF_CFG				0x078
 #define NPU2_INHIBIT_CFG			0x080
 #define NPU2_C_ERR_RPT_MSG0			0x088

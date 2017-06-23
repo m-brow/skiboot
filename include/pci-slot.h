@@ -109,7 +109,7 @@ struct pci_slot_ops {
 	int64_t (*creset)(struct pci_slot *slot);
 	int64_t (*freset)(struct pci_slot *slot);
 	int64_t (*hreset)(struct pci_slot *slot);
-	int64_t (*poll)(struct pci_slot *slot);
+	int64_t (*run_sm)(struct pci_slot *slot);
 
 	/* Auxillary functions */
 	void (*add_properties)(struct pci_slot *slot, struct dt_node *np);
@@ -148,6 +148,7 @@ struct pci_slot {
 #define PCI_SLOT_FLAG_BOOTUP		0x1
 #define PCI_SLOT_FLAG_FORCE_POWERON	0x2
 #define PCI_SLOT_FLAG_BROKEN_PDC	0x4
+#define PCI_SLOT_FLAG_ENFORCE		0x8
 
 	struct phb		*phb;
 	struct pci_device	*pd;

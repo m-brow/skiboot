@@ -131,6 +131,7 @@ enum proc_chip_quirks {
 	QUIRK_SIMICS		= 0x00000020,
 	QUIRK_SLOW_SIM		= 0x00000040,
 	QUIRK_NO_DIRECT_CTL	= 0x00000080,
+	QUIRK_NO_RNG		= 0x00000100,
 };
 
 extern enum proc_chip_quirks proc_chip_quirks;
@@ -190,6 +191,7 @@ struct proc_chip {
 
 	/* Must hold capi_lock to change */
 	uint8_t			capp_phb3_attached_mask;
+	uint8_t			capp_phb4_attached_mask;
 	uint8_t			capp_ucode_loaded;
 
 	/* Used by hw/centaur.c */

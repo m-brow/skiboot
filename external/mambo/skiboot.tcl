@@ -31,6 +31,8 @@ if { ![info exists env(SKIBOOT_ZIMAGE)] } {
 }
 mconfig payload PAYLOAD $env(SKIBOOT_ZIMAGE)
 
+mconfig linux_cmdline LINUX_CMDLINE ""
+
 # Paylod: Memory location for a Linux style ramdisk/initrd
 mconfig payload_addr PAYLOAD_ADDR 0x20000000;
 
@@ -80,8 +82,8 @@ if { $default_config == "PEGASUS" } {
     myconf config processor/initial/PVR 0x4b0201
 }
 if { $default_config == "P9" } {
-    # make sure we look like a POWER9 DD2
-    myconf config processor/initial/PVR 0x4e0200
+    # PVR configured for POWER9 DD2.0 Scale out 24 Core (ie SMT4)
+    myconf config processor/initial/PVR 0x4e1200
     myconf config processor/initial/SIM_CTRL1 0xc228000400000000
 }
 if { [info exists env(SKIBOOT_SIMCONF)] } {
@@ -103,6 +105,22 @@ if {![info exists of::encode_compat]} {
 # allows running mambo in another directory to the one skiboot.tcl is in.
 if { [file exists mambo_utils.tcl] } then {
 	source mambo_utils.tcl
+
+	if { [info exists env(VMLINUX_MAP)] } {
+		global linux_symbol_map
+
+		set fp [open $env(VMLINUX_MAP) r]
+		set linux_symbol_map [read $fp]
+		close $fp
+	}
+
+	if { [info exists env(SKIBOOT_MAP)] } {
+		global skiboot_symbol_map
+
+		set fp [open $env(SKIBOOT_MAP) r]
+		set skiboot_symbol_map [read $fp]
+		close $fp
+	}
 }
 
 #
@@ -171,14 +189,21 @@ mysim of addprop $xscom_node byte_array "compatible" $compat
 # Load any initramfs
 set cpio_start 0x80000000
 set cpio_end $cpio_start
+set cpio_size 0
 if { [info exists env(SKIBOOT_INITRD)] } {
-    set cpio_file $env(SKIBOOT_INITRD)
+
+    set cpios [split $env(SKIBOOT_INITRD) ","]
+
+    foreach cpio_file $cpios {
+	    set cpio_file [string trim $cpio_file]
+	    set cpio_size [file size $cpio_file]
+	    mysim mcm 0 memory fread $cpio_end $cpio_size $cpio_file
+	    set cpio_end [expr $cpio_end + $cpio_size]
+    }
+
     set chosen_node [mysim of find_device /chosen]
-    set cpio_size [file size $cpio_file]
-    set cpio_end [expr $cpio_start + $cpio_size]
     mysim of addprop $chosen_node int "linux,initrd-start" $cpio_start
     mysim of addprop $chosen_node int "linux,initrd-end"   $cpio_end
-    mysim mcm 0 memory fread $cpio_start $cpio_size $cpio_file
 }
 
 # Default NVRAM is blank and will be formatted by Skiboot if no file is provided
@@ -194,6 +219,15 @@ if { [info exists env(SKIBOOT_NVRAM)] } {
 
 # Add device tree entry for NVRAM
 set reserved_memory [mysim of addchild $root_node "reserved-memory" ""]
+mysim of addprop $reserved_memory int "#size-cells" 2
+mysim of addprop $reserved_memory int "#address-cells" 2
+mysim of addprop $reserved_memory empty "ranges" ""
+
+set initramfs_res [mysim of addchild $reserved_memory "initramfs" ""]
+set reg [list $cpio_start $cpio_size ]
+mysim of addprop $initramfs_res array64 "reg" reg
+mysim of addprop $initramfs_res empty "name" "initramfs"
+
 set fake_nvram_node [mysim of addchild $reserved_memory "ibm,fake-nvram" ""]
 set reg [list $fake_nvram_start $fake_nvram_size ]
 mysim of addprop $fake_nvram_node array64 "reg" reg
@@ -210,10 +244,20 @@ if { $default_config == "P9" } {
 set pir 0
 for { set c 0 } { $c < $mconf(cpus) } { incr c } {
     set cpu_node [mysim of find_device "/cpus/PowerPC@$pir"]
-    mysim of addprop $cpu_node int "ibm,chip-id" $c
     mysim of addprop $cpu_node int "ibm,pir" $pir
     set reg  [list 0x0000001c00000028 0xffffffffffffffff]
     mysim of addprop $cpu_node array64 "ibm,processor-segment-sizes" reg
+
+    mysim of addprop $cpu_node int "ibm,chip-id" $c
+
+    # Create a chip node to tell skiboot to create another chip for this CPU.
+    # This bubbles up to Linux which will then see a new chip (aka nid).
+    # For chip 0 the xscom node above has already definied chip 0, so skip it.
+    if { $c > 0 } {
+        set node [mysim of addchild $root_node "mambo-chip" [format %x $c]]
+        mysim of addprop $node int "ibm,chip-id" $c
+        mysim of addprop $node string "compatible" "ibm,mambo-chip"
+    }
 
     set reg {}
     lappend reg 0x0000000c 0x00000010 0x00000018 0x00000022
@@ -311,7 +355,9 @@ if { [info exists env(SKIBOOT_ENABLE_MAMBO_STB)] } {
 
 # Kernel command line args, appended to any from the device tree
 # e.g.: of::set_bootargs "xmon"
-of::set_bootargs ""
+#
+# Can be set from the environment by setting LINUX_CMDLINE.
+of::set_bootargs $mconf(linux_cmdline)
 
 # Load images
 
