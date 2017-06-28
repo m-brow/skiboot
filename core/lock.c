@@ -20,6 +20,7 @@
 #include <processor.h>
 #include <cpu.h>
 #include <console.h>
+#include <timebase.h>
 
 /* Set to bust locks. Note, this is initialized to true because our
  * lock debugging code is not going to work until we have the per
@@ -132,11 +133,27 @@ static void remove_lock_request(void)
 	this_cpu()->requested_lock = NULL;
 }
 
+#define LOCK_TIMEOUT_MS 10000
+static inline bool lock_timeout(unsigned long start)
+{
+	/* Print warning if lock has been spinning for more than TIMEOUT_MS */
+	unsigned long wait = tb_to_msecs(mftb());
+
+	if (wait - start > LOCK_TIMEOUT_MS) {
+		prlog(PR_WARNING, "WARNING: Lock has been "\
+		      "spinning for %lums\n", wait - start);
+		backtrace();
+		return true;
+	}
+
+	return false;
+}
 #else
 static inline void lock_check(struct lock *l) { };
 static inline void unlock_check(struct lock *l) { };
 static inline void add_lock_request(struct lock *l) { };
 static inline void remove_lock_request(void) { };
+static inline bool lock_timeout(unsigned long s) { return false; }
 #endif /* DEBUG_LOCKS */
 
 bool lock_held_by_me(struct lock *l)
@@ -157,8 +174,12 @@ bool try_lock(struct lock *l)
 	return false;
 }
 
+
 void lock(struct lock *l)
 {
+	bool timeout_warn = false;
+	unsigned long start;
+
 	if (bust_locks)
 		return;
 
@@ -168,6 +189,10 @@ void lock(struct lock *l)
 		return;
 	add_lock_request(l);
 
+#ifdef DEBUG_LOCKS
+	start = tb_to_msecs(mftb());
+#endif
+
 	for (;;) {
 		if (try_lock(l))
 			break;
@@ -175,6 +200,9 @@ void lock(struct lock *l)
 		while (l->lock_val)
 			barrier();
 		smt_medium();
+
+		if (!timeout_warn)
+			timeout_warn = lock_timeout(start);
 	}
 
 	remove_lock_request();
