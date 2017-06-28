@@ -28,6 +28,7 @@
 bool bust_locks = true;
 
 #ifdef DEBUG_LOCKS
+static struct lock dl_lock = LOCK_UNLOCKED;
 
 static void lock_error(struct lock *l, const char *reason, uint16_t err)
 {
@@ -61,9 +62,81 @@ static void unlock_check(struct lock *l)
 		lock_error(l, "Releasing lock with 0 depth", 4);
 }
 
+/* Find circular dependencies in the lock requests. */
+static bool check_deadlock(void)
+{
+	uint32_t lock_owner, start, i;
+	struct cpu_thread *next_cpu;
+	struct lock *next;
+
+	next  = this_cpu()->requested_lock;
+	start = this_cpu()->pir;
+	i = 0;
+
+	while (i < cpu_max_pir) {
+
+		if (!next)
+			return false;
+
+		if (!(next->lock_val & 1) || next->in_con_path)
+			return false;
+
+		lock_owner = next->lock_val >> 32;
+
+		if (lock_owner == start)
+			return true;
+
+		next_cpu = find_cpu_by_pir(lock_owner);
+
+		if (!next_cpu)
+			return false;
+
+		next = next_cpu->requested_lock;
+		i++;
+	}
+
+	return false;
+}
+
+static void add_lock_request(struct lock *l)
+{
+	struct cpu_thread *curr = this_cpu();
+
+	if (curr->state != cpu_state_active &&
+	    curr->state != cpu_state_os)
+		return;
+
+	/*
+	 * For deadlock detection we must keep the lock states constant
+	 * while doing the deadlock check.
+	 */
+	for (;;) {
+		if (try_lock(&dl_lock))
+			break;
+		smt_lowest();
+		while (dl_lock.lock_val)
+			barrier();
+		smt_medium();
+	}
+
+	curr->requested_lock = l;
+
+	if (check_deadlock())
+		lock_error(l, "Deadlock detected", 0);
+
+	unlock(&dl_lock);
+}
+
+static void remove_lock_request(void)
+{
+	this_cpu()->requested_lock = NULL;
+}
+
 #else
 static inline void lock_check(struct lock *l) { };
 static inline void unlock_check(struct lock *l) { };
+static inline void add_lock_request(struct lock *l) { };
+static inline void remove_lock_request(void) { };
 #endif /* DEBUG_LOCKS */
 
 bool lock_held_by_me(struct lock *l)
@@ -90,6 +163,11 @@ void lock(struct lock *l)
 		return;
 
 	lock_check(l);
+
+	if (try_lock(l))
+		return;
+	add_lock_request(l);
+
 	for (;;) {
 		if (try_lock(l))
 			break;
@@ -98,6 +176,8 @@ void lock(struct lock *l)
 			barrier();
 		smt_medium();
 	}
+
+	remove_lock_request();
 }
 
 void unlock(struct lock *l)

@@ -95,6 +95,11 @@ struct cpu_thread {
 
 	/* For use by XICS emulation on XIVE */
 	struct xive_cpu_state		*xstate;
+
+#ifdef DEBUG_LOCKS
+	/* The lock requested by this cpu, used for deadlock detection */
+	struct lock			*requested_lock;
+#endif
 };
 
 /* This global is set to 1 to allow secondaries to callin,
