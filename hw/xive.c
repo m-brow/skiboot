@@ -353,6 +353,10 @@ struct xive {
 	uint32_t	chip_id;
 	uint32_t	block_id;
 	struct dt_node	*x_node;
+	int		rev;
+#define XIVE_REV_UNKNOWN	0	/* Unknown version */
+#define XIVE_REV_1		1	/* P9 (Nimbus) DD1.x */
+#define XIVE_REV_2		2	/* P9 (Nimbus) DD2.x or Cumulus */
 
 	uint64_t	xscom_base;
 
@@ -488,6 +492,7 @@ static struct dt_node *xive_dt_node;
 static uint32_t xive_block_to_chip[XIVE_MAX_CHIPS];
 static uint32_t xive_block_count;
 
+#ifdef USE_BLOCK_GROUP_MODE
 static uint32_t xive_chip_to_block(uint32_t chip_id)
 {
 	struct proc_chip *c = get_chip(chip_id);
@@ -496,6 +501,7 @@ static uint32_t xive_chip_to_block(uint32_t chip_id)
 	assert(c->xive);
 	return c->xive->block_id;
 }
+#endif
 
 /* Conversion between GIRQ and block/index.
  *
@@ -1506,46 +1512,6 @@ static bool xive_set_local_tables(struct xive *x)
 	return true;
 }
 
-static bool xive_read_bars(struct xive *x)
-{
-	uint64_t bar, msk;
-
-	/* Read IC BAR */
-	bar = xive_regrx(x, CQ_IC_BAR);
-	if (bar & CQ_IC_BAR_64K)
-		x->ic_shift = 16;
-	else
-		x->ic_shift = 12;
-	x->ic_size = 8ul << x->ic_shift;
-	x->ic_base = (void *)(bar & 0x00ffffffffffffffull);
-
-	/* Read TM BAR */
-	bar = xive_regrx(x, CQ_TM1_BAR);
-	assert(bar & CQ_TM_BAR_VALID);
-	if (bar & CQ_TM_BAR_64K)
-		x->tm_shift = 16;
-	else
-		x->tm_shift = 12;
-	x->tm_size = 4ul << x->tm_shift;
-	x->tm_base = (void *)(bar & 0x00ffffffffffffffull);
-
-	/* Read PC BAR */
-	bar = xive_regr(x, CQ_PC_BAR);
-	msk = xive_regr(x, CQ_PC_BARM) | 0xffffffc000000000ul;
-	assert(bar & CQ_PC_BAR_VALID);
-	x->pc_size = (~msk) + 1;
-	x->pc_base = (void *)(bar & 0x00ffffffffffffffull);
-
-	/* Read VC BAR */
-	bar = xive_regr(x, CQ_VC_BAR);
-	msk = xive_regr(x, CQ_VC_BARM) | 0xfffff80000000000ul;
-	assert(bar & CQ_VC_BAR_VALID);
-	x->vc_size = (~msk) + 1;
-	x->vc_base = (void *)(bar & 0x00ffffffffffffffull);
-
-	return true;
-}
-
 static bool xive_configure_bars(struct xive *x)
 {
 	uint64_t chip_id = x->chip_id;
@@ -1609,44 +1575,6 @@ static bool xive_configure_bars(struct xive *x)
 	if (x->last_reg_error)
 		return false;
 
-	return true;
-}
-
-static void xive_dump_mmio(struct xive *x)
-{
-	prlog(PR_DEBUG, " CQ_CFG_PB_GEN = %016llx\n",
-	      in_be64(x->ic_base + CQ_CFG_PB_GEN));
-	prlog(PR_DEBUG, " CQ_MSGSND     = %016llx\n",
-	      in_be64(x->ic_base + CQ_MSGSND));
-}
-
-static bool xive_check_update_bars(struct xive *x)
-{
-	uint64_t val;
-	bool force_assign;
-
-	/* Check if IC BAR is enabled */
-	val = xive_regrx(x, CQ_IC_BAR);
-	if (x->last_reg_error)
-		return false;
-
-	/* Check if device-tree tells us to force-assign the BARs */
-#if 0
-	force_assign = dt_has_node_property(x->x_node,
-					    "force-assign-bars", NULL);
-#else
-	force_assign = true;
-#endif
-	if ((val & CQ_IC_BAR_VALID) && !force_assign) {
-		xive_dbg(x, "IC BAR valid, using existing values\n");
-		if (!xive_read_bars(x))
-			return false;
-	} else {
-		xive_warn(x, "IC BAR invalid, reconfiguring\n");
-		if (!xive_configure_bars(x))
-			return false;
-	}
-
 	/* Calculate some MMIO bases in the VC BAR */
 	x->esb_mmio = x->vc_base;
 	x->eq_mmio = x->vc_base + (x->vc_size / VC_MAX_SETS) * VC_ESB_SETS;
@@ -1660,6 +1588,14 @@ static bool xive_check_update_bars(struct xive *x)
 	xive_dbg(x, "VC: %14p [0x%012llx]\n", x->vc_base, x->vc_size);
 
 	return true;
+}
+
+static void xive_dump_mmio(struct xive *x)
+{
+	prlog(PR_DEBUG, " CQ_CFG_PB_GEN = %016llx\n",
+	      in_be64(x->ic_base + CQ_CFG_PB_GEN));
+	prlog(PR_DEBUG, " CQ_MSGSND     = %016llx\n",
+	      in_be64(x->ic_base + CQ_MSGSND));
 }
 
 static bool xive_config_init(struct xive *x)
@@ -1678,20 +1614,37 @@ static bool xive_config_init(struct xive *x)
 	val = xive_regr(x, VC_GLOBAL_CONFIG);
 	val |= VC_GCONF_INDIRECT;
 	xive_regw(x, VC_GLOBAL_CONFIG, val);
+#endif
 
 	/* Enable indirect mode in PC config */
 	val = xive_regr(x, PC_GLOBAL_CONFIG);
+#ifdef USE_INDIRECT
 	val |= PC_GCONF_INDIRECT;
-	xive_regw(x, PC_GLOBAL_CONFIG, val);
 #endif
+	val |= PC_GCONF_CHIPID_OVR;
+	val = SETFIELD(PC_GCONF_CHIPID, val, x->block_id);
+	xive_regw(x, PC_GLOBAL_CONFIG, val);
+	xive_dbg(x, "PC_GLOBAL_CONFIG=%016llx\n", val);
 
 	val = xive_regr(x, PC_TCTXT_CFG);
 #ifdef USE_BLOCK_GROUP_MODE
 	val |= PC_TCTXT_CFG_BLKGRP_EN | PC_TCTXT_CFG_HARD_CHIPID_BLK;
 #endif
 	val |= PC_TCTXT_CHIPID_OVERRIDE;
+	val |= PC_TCTXT_CFG_TARGET_EN;
 	val = SETFIELD(PC_TCTXT_CHIPID, val, x->block_id);
 	xive_regw(x, PC_TCTXT_CFG, val);
+	xive_dbg(x, "PC_TCTXT_CFG=%016llx\n", val);
+
+	/* Subsequent inits are DD2 only */
+	if (x->rev < XIVE_REV_2)
+		return true;
+
+	/* Enable StoreEOI */
+	val = xive_regr(x, VC_SBC_CONFIG);
+	val |= VC_SBC_CONF_CPLX_CIST | VC_SBC_CONF_CIST_BOTH;
+	val |= VC_SBC_CONF_NO_UPD_PRF;
+	xive_regw(x, VC_SBC_CONFIG, val);
 
 	return true;
 }
@@ -2562,7 +2515,7 @@ void __xive_source_eoi(struct irq_source *is, uint32_t isn)
 
 	/* If the XIVE supports the new "store EOI facility, use it */
 	if (s->flags & XIVE_SRC_STORE_EOI)
-		out_be64(mmio_base, 0);
+		out_be64(mmio_base + 0x400, 0);
 	else {
 		uint64_t offset;
 
@@ -2682,6 +2635,7 @@ void xive_register_ipi_source(uint32_t base, uint32_t count, void *data,
 	struct xive *x = xive_from_isn(base);
 	uint32_t base_idx = GIRQ_TO_IDX(base);
 	void *mmio_base;
+	uint32_t flags = XIVE_SRC_EOI_PAGE1 | XIVE_SRC_TRIGGER_PAGE;
 
 	assert(x);
 	assert(base >= x->int_base && (base + count) <= x->int_ipi_top);
@@ -2689,19 +2643,23 @@ void xive_register_ipi_source(uint32_t base, uint32_t count, void *data,
 	s = malloc(sizeof(struct xive_src));
 	assert(s);
 
+	/* Store EOI supported on DD2.0 */
+	if (x->rev >= XIVE_REV_2)
+		flags |= XIVE_SRC_STORE_EOI;
+
 	/* Callbacks assume the MMIO base corresponds to the first
 	 * interrupt of that source structure so adjust it
 	 */
 	mmio_base = x->esb_mmio + (1ul << IPI_ESB_SHIFT) * base_idx;
 	__xive_register_source(x, s, base, count, IPI_ESB_SHIFT, mmio_base,
-			       XIVE_SRC_EOI_PAGE1 | XIVE_SRC_TRIGGER_PAGE,
-			       false, data, ops);
+			       flags, false, data, ops);
 }
 
 static struct xive *init_one_xive(struct dt_node *np)
 {
 	struct xive *x;
 	struct proc_chip *chip;
+	uint32_t flags;
 
 	x = zalloc(sizeof(struct xive));
 	assert(x);
@@ -2717,7 +2675,18 @@ static struct xive *init_one_xive(struct dt_node *np)
 
 	chip = get_chip(x->chip_id);
 	assert(chip);
-	xive_dbg(x, "Initializing, block ID %d...\n", x->block_id);
+
+	x->rev = XIVE_REV_UNKNOWN;
+	if (chip->type == PROC_CHIP_P9_NIMBUS) {
+		if ((chip->ec_level & 0xf0) == 0x10)
+			x->rev = XIVE_REV_1;
+		else if ((chip->ec_level & 0xf0) == 0x20)
+			x->rev = XIVE_REV_2;
+	} else if (chip->type == PROC_CHIP_P9_CUMULUS)
+		x->rev = XIVE_REV_2;
+
+	xive_dbg(x, "Initializing rev %d block ID %d...\n",
+		 x->rev, x->block_id);
 	chip->xive = x;
 
 #ifdef USE_INDIRECT
@@ -2756,8 +2725,9 @@ static struct xive *init_one_xive(struct dt_node *np)
 	//xive_regwx(x, CQ_CFG_PB_GEN, xx);
 	//xive_regwx(x, CQ_MSGSND, xx);
 
-	/* Verify the BARs are initialized and if not, setup a default layout */
-	xive_check_update_bars(x);
+	/* Setup the BARs */
+	if (!xive_configure_bars(x))
+		goto fail;
 
 	/* Some basic global inits such as page sizes etc... */
 	if (!xive_config_init(x))
@@ -2781,11 +2751,12 @@ static struct xive *init_one_xive(struct dt_node *np)
 		goto fail;
 
 	/* Register built-in source controllers (aka IPIs) */
+	flags = XIVE_SRC_EOI_PAGE1 | XIVE_SRC_TRIGGER_PAGE;
+	if (x->rev >= XIVE_REV_2)
+		flags |= XIVE_SRC_STORE_EOI;
 	__xive_register_source(x, &x->ipis, x->int_base,
 			       x->int_hw_bot - x->int_base, IPI_ESB_SHIFT,
-			       x->esb_mmio,
-			       XIVE_SRC_EOI_PAGE1 | XIVE_SRC_TRIGGER_PAGE,
-			       true, NULL, NULL);
+			       x->esb_mmio, flags, true, NULL, NULL);
 
 	/* Register escalation sources */
 	__xive_register_source(x, &x->esc_irqs,

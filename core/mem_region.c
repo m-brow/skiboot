@@ -1,4 +1,4 @@
-/* Copyright 2013-2014 IBM Corp.
+/* Copyright 2013-2017 IBM Corp.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -926,7 +926,7 @@ static void mem_region_parse_reserved_properties(void)
 	const struct dt_property *names, *ranges;
 	struct mem_region *region;
 
-	prlog(PR_INFO, "MEM: parsing reserved memory from "
+	prlog(PR_DEBUG, "MEM: parsing reserved memory from "
 			"reserved-names/-ranges properties\n");
 
 	names = dt_find_property(dt_root, "reserved-names");
@@ -947,7 +947,10 @@ static void mem_region_parse_reserved_properties(void)
 					dt_get_number(range, 2),
 					dt_get_number(range + 1, 2),
 					NULL, REGION_FW_RESERVED);
-			add_region(region);
+			if (!add_region(region)) {
+				prerror("Couldn't add mem_region %s\n", name);
+				abort();
+			}
 		}
 	} else if (names || ranges) {
 		prerror("Invalid properties: reserved-names=%p "

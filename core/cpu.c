@@ -49,9 +49,12 @@ unsigned int cpu_max_pir;
 struct cpu_thread *boot_cpu;
 static struct lock reinit_lock = LOCK_UNLOCKED;
 static bool hile_supported;
+static bool radix_supported;
 static unsigned long hid0_hile;
 static unsigned long hid0_attn;
 static bool pm_enabled;
+static bool current_hile_mode;
+static bool current_radix_mode;
 
 unsigned long cpu_secondary_start __force_data = 0;
 
@@ -657,7 +660,7 @@ void trigger_attn(void)
 	__trigger_attn();
 }
 
-void init_hid(void)
+static void init_hid(void)
 {
 	/* attn is enabled even when HV=0, so make sure it's off */
 	disable_attn();
@@ -699,6 +702,7 @@ void init_boot_cpu(void)
 	case PVR_TYPE_P9:
 		proc_gen = proc_gen_p9;
 		hile_supported = true;
+		radix_supported = true;
 		hid0_hile = SPR_HID0_POWER9_HILE;
 		hid0_attn = SPR_HID0_POWER9_ENABLE_ATTN;
 		break;
@@ -712,19 +716,19 @@ void init_boot_cpu(void)
 		cpu_thread_count = 4;
 		cpu_max_pir = SPR_PIR_P7_MASK;
 		prlog(PR_INFO, "CPU: P7 generation processor"
-		      "(max %d threads/core)\n", cpu_thread_count);
+		      " (max %d threads/core)\n", cpu_thread_count);
 		break;
 	case proc_gen_p8:
 		cpu_thread_count = 8;
 		cpu_max_pir = SPR_PIR_P8_MASK;
 		prlog(PR_INFO, "CPU: P8 generation processor"
-		      "(max %d threads/core)\n", cpu_thread_count);
+		      " (max %d threads/core)\n", cpu_thread_count);
 		break;
 	case proc_gen_p9:
 		cpu_thread_count = 4;
 		cpu_max_pir = SPR_PIR_P9_MASK;
 		prlog(PR_INFO, "CPU: P9 generation processor"
-		      "(max %d threads/core)\n", cpu_thread_count);
+		      " (max %d threads/core)\n", cpu_thread_count);
 		break;
 	default:
 		prerror("CPU: Unknown PVR, assuming 1 thread\n");
@@ -929,6 +933,8 @@ void cpu_callin(struct cpu_thread *cpu)
 {
 	cpu->state = cpu_state_active;
 	cpu->job_has_no_return = false;
+
+	init_hid();
 }
 
 static void opal_start_thread_job(void *data)
@@ -1022,44 +1028,88 @@ static int64_t opal_return_cpu(void)
 }
 opal_call(OPAL_RETURN_CPU, opal_return_cpu, 0);
 
-static void cpu_change_hile(void *hilep)
+struct hid0_change_req {
+	uint64_t clr_bits;
+	uint64_t set_bits;
+};
+
+static void cpu_change_hid0(void *__req)
 {
-	bool hile = *(bool *)hilep;
-	unsigned long hid0;
+	struct hid0_change_req *req = __req;
+	unsigned long hid0, new_hid0;
 
-	hid0 = mfspr(SPR_HID0);
-	if (hile)
-		hid0 |= hid0_hile;
-	else
-		hid0 &= ~hid0_hile;
-	prlog(PR_DEBUG, "CPU: [%08x] HID0 set to 0x%016lx\n",
-	      this_cpu()->pir, hid0);
-	set_hid0(hid0);
-
-	this_cpu()->current_hile = hile;
+	hid0 = new_hid0 = mfspr(SPR_HID0);
+	new_hid0 &= ~req->clr_bits;
+	new_hid0 |= req->set_bits;
+	prlog(PR_DEBUG, "CPU: [%08x] HID0 change 0x%016lx -> 0x%016lx\n",
+		this_cpu()->pir, hid0, new_hid0);
+	set_hid0(new_hid0);
 }
 
-static int64_t cpu_change_all_hile(bool hile)
+static int64_t cpu_change_all_hid0(struct hid0_change_req *req)
 {
 	struct cpu_thread *cpu;
 
-	prlog(PR_INFO, "CPU: Switching HILE on all CPUs to %d\n", hile);
-
 	for_each_available_cpu(cpu) {
-		if (cpu->current_hile == hile)
+		if (!cpu_is_thread0(cpu))
 			continue;
 		if (cpu == this_cpu()) {
-			cpu_change_hile(&hile);
+			cpu_change_hid0(req);
 			continue;
 		}
-		cpu_wait_job(cpu_queue_job(cpu, "cpu_change_hile",
-					   cpu_change_hile, &hile), true);
+		cpu_wait_job(cpu_queue_job(cpu, "cpu_change_hid0",
+			cpu_change_hid0, req), true);
 	}
 	return OPAL_SUCCESS;
 }
 
+void cpu_set_radix_mode(void)
+{
+	struct hid0_change_req req;
+
+	if (!radix_supported)
+		return;
+
+	req.clr_bits = 0;
+	req.set_bits = SPR_HID0_POWER9_RADIX;
+	cleanup_global_tlb();
+	current_radix_mode = true;
+	cpu_change_all_hid0(&req);
+}
+
+static void cpu_cleanup_one(void *param __unused)
+{
+	mtspr(SPR_AMR, 0);
+	mtspr(SPR_IAMR, 0);
+}
+
+static int64_t cpu_cleanup_all(void)
+{
+	struct cpu_thread *cpu;
+
+	for_each_available_cpu(cpu) {
+		if (cpu == this_cpu()) {
+			cpu_cleanup_one(NULL);
+			continue;
+		}
+		cpu_wait_job(cpu_queue_job(cpu, "cpu_cleanup",
+					   cpu_cleanup_one, NULL), true);
+	}
+	return OPAL_SUCCESS;
+}
+
+void cpu_fast_reboot_complete(void)
+{
+	/* Fast reboot will have cleared HID0:HILE */
+	current_hile_mode = false;
+
+	/* On P9, restore radix mode */
+	cpu_set_radix_mode();
+}
+
 static int64_t opal_reinit_cpus(uint64_t flags)
 {
+	struct hid0_change_req req = { 0, 0 };
 	struct cpu_thread *cpu;
 	int64_t rc = OPAL_SUCCESS;
 	int i;
@@ -1104,17 +1154,51 @@ static int64_t opal_reinit_cpus(uint64_t flags)
 	unlock(&reinit_lock);
 
 	/*
-	 * If the flags affect endianness and we are on P8 DD2 or later, then
-	 * use the HID bit. We use the PVR (we could use the EC level in
-	 * the chip but the PVR is more readily available).
+	 * This cleans up a few things left over by Linux
+	 * that can cause problems in cases such as radix->hash
+	 * transitions. Ideally Linux should do it but doing it
+	 * here works around existing broken kernels.
 	 */
+	cpu_cleanup_all();
+
+	/* If HILE change via HID0 is supported ... */
 	if (hile_supported &&
-	    (flags & (OPAL_REINIT_CPUS_HILE_BE | OPAL_REINIT_CPUS_HILE_LE))) {
+	    (flags & (OPAL_REINIT_CPUS_HILE_BE |
+		      OPAL_REINIT_CPUS_HILE_LE))) {
 		bool hile = !!(flags & OPAL_REINIT_CPUS_HILE_LE);
 
 		flags &= ~(OPAL_REINIT_CPUS_HILE_BE | OPAL_REINIT_CPUS_HILE_LE);
-		rc = cpu_change_all_hile(hile);
+		if (hile != current_hile_mode) {
+			if (hile)
+				req.set_bits |= hid0_hile;
+			else
+				req.clr_bits |= hid0_hile;
+			current_hile_mode = hile;
+		}
 	}
+
+	/* If MMU mode change is supported */
+	if (radix_supported &&
+	    (flags & (OPAL_REINIT_CPUS_MMU_HASH |
+		      OPAL_REINIT_CPUS_MMU_RADIX))) {
+		bool radix = !!(flags & OPAL_REINIT_CPUS_MMU_RADIX);
+
+		flags &= ~(OPAL_REINIT_CPUS_MMU_HASH |
+			   OPAL_REINIT_CPUS_MMU_RADIX);
+		if (radix != current_radix_mode) {
+			if (radix)
+				req.set_bits |= SPR_HID0_POWER9_RADIX;
+			else
+				req.clr_bits |= SPR_HID0_POWER9_RADIX;
+
+			cleanup_global_tlb();
+			current_radix_mode = radix;
+		}
+	}
+
+	/* Apply HID bits changes if any */
+	if (req.set_bits || req.clr_bits)
+		cpu_change_all_hid0(&req);
 
 	/* If we have a P7, error out for LE switch, do nothing for BE */
 	if (proc_gen < proc_gen_p8) {

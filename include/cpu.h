@@ -48,7 +48,6 @@ struct cpu_thread {
 	uint32_t			server_no;
 	uint32_t			chip_id;
 	bool				is_secondary;
-	bool				current_hile;
 	struct cpu_thread		*primary;
 	enum cpu_thread_state		state;
 	struct dt_node			*node;
@@ -129,7 +128,6 @@ static inline void __nomcount cpu_relax(void)
 void pre_init_boot_cpu(void);
 void init_boot_cpu(void);
 void init_all_cpus(void);
-void init_hid(void);
 
 /* This brings up our secondaries */
 extern void cpu_bringup(void);
@@ -271,5 +269,8 @@ extern unsigned long __attrconst cpu_stack_top(unsigned int pir);
 
 extern void cpu_idle_job(void);
 extern void cpu_idle_delay(unsigned long delay, unsigned long min_pm);
+
+extern void cpu_set_radix_mode(void);
+extern void cpu_fast_reboot_complete(void);
 
 #endif /* __CPU_H */

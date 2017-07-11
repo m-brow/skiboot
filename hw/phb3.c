@@ -4683,7 +4683,7 @@ static void phb3_create(struct dt_node *np)
 	p->phb.base_loc_code = dt_prop_get_def(dt_root,
 					       "ibm,io-base-loc-code", NULL);
 	if (!p->phb.base_loc_code)
-		PHBERR(p, "Base location code not found !\n");
+		PHBDBG(p, "Base location code not found !\n");
 
 	/* Priority order: NVRAM -> dt -> GEN3 */
 	p->max_link_speed = 3;
@@ -4934,16 +4934,6 @@ static void phb3_probe_pbcq(struct dt_node *pbcq)
 	add_chip_dev_associativity(np);
 }
 
-void phb3_preload_vpd(void)
-{
-	const struct dt_property *prop;
-
-	prop = dt_find_property(dt_root, "ibm,io-vpd");
-	if (!prop) {
-		/* LX VPD Lid not already loaded */
-		vpd_preload(dt_root);
-	}
-}
 
 void probe_phb3(void)
 {

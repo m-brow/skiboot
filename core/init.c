@@ -48,6 +48,7 @@
 #include <libstb/stb.h>
 #include <libstb/container.h>
 #include <phys-map.h>
+#include <imc.h>
 
 enum proc_gen proc_gen;
 unsigned int pcie_max_link_speed;
@@ -119,8 +120,8 @@ static bool try_load_elf64_le(struct elf_hdr *header)
 	kernel_size = le64_to_cpu(kh->e_shoff) +
 		(le16_to_cpu(kh->e_shentsize) * le16_to_cpu(kh->e_shnum));
 
-	printf("INIT: 64-bit kernel entry at 0x%llx, size 0x%lx\n",
-	       kernel_entry, kernel_size);
+	prlog(PR_DEBUG, "INIT: 64-bit kernel entry at 0x%llx, size 0x%lx\n",
+	      kernel_entry, kernel_size);
 
 	return true;
 }
@@ -371,7 +372,7 @@ static bool load_kernel(void)
 	if (dt_has_node_property(dt_chosen, "kernel-base-address", NULL)) {
 		kernel_entry = dt_prop_get_u64(dt_chosen,
 					       "kernel-base-address");
-		printf("INIT: Kernel image at 0x%llx\n",kernel_entry);
+		prlog(PR_DEBUG, "INIT: Kernel image at 0x%llx\n", kernel_entry);
 		kh = (struct elf_hdr *)kernel_entry;
 		/*
 		 * If the kernel is at 0, restore it as it was overwritten
@@ -398,11 +399,12 @@ static bool load_kernel(void)
 		}
 	}
 
-	printf("INIT: Kernel loaded, size: %zu bytes (0 = unknown preload)\n",
-	       kernel_size);
+	prlog(PR_DEBUG,
+	      "INIT: Kernel loaded, size: %zu bytes (0 = unknown preload)\n",
+	      kernel_size);
 
 	if (kh->ei_ident != ELF_IDENT) {
-		printf("INIT: ELF header not found. Assuming raw binary.\n");
+		prerror("INIT: ELF header not found. Assuming raw binary.\n");
 		return true;
 	}
 
@@ -413,7 +415,7 @@ static bool load_kernel(void)
 		if (!try_load_elf32(kh))
 			return false;
 	} else {
-		printf("INIT: Neither ELF32 not ELF64 ?\n");
+		prerror("INIT: Neither ELF32 not ELF64 ?\n");
 		return false;
 	}
 
@@ -542,7 +544,7 @@ void __noreturn load_and_boot_kernel(bool is_reboot)
 
 	/* Dump the selected console */
 	stdoutp = dt_prop_get_def(dt_chosen, "linux,stdout-path", NULL);
-	printf("INIT: stdout-path: %s\n", stdoutp ? stdoutp : "");
+	prlog(PR_DEBUG, "INIT: stdout-path: %s\n", stdoutp ? stdoutp : "");
 
 
 	printf("INIT: Starting kernel at 0x%llx, fdt at %p %u bytes)\n",
@@ -808,8 +810,8 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 	/* Call library constructors */
 	do_ctors();
 
-	printf("SkiBoot %s starting...\n", version);
-	printf("initial console log level: memory %d, driver %d\n",
+	prlog(PR_NOTICE, "OPAL %s starting...\n", version);
+	prlog(PR_DEBUG, "initial console log level: memory %d, driver %d\n",
 	       (debug_descriptor.console_log_levels >> 4),
 	       (debug_descriptor.console_log_levels & 0x0f));
 	prlog(PR_TRACE, "You will not see this\n");
@@ -976,6 +978,9 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 	/* Read in NVRAM and set it up */
 	nvram_init();
 
+	/* preload the IMC catalog dtb */
+	imc_catalog_preload();
+
 	/* Set the console level */
 	console_log_level();
 
@@ -992,12 +997,15 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 
 	pci_nvram_init();
 
-	phb3_preload_vpd();
+	preload_io_vpd();
 	preload_capp_ucode();
 	start_preload_kernel();
 
 	/* NX init */
 	nx_init();
+
+	/* Init In-Memory Collection related stuff (load the IMC dtb into memory) */
+	imc_init();
 
 	/* Probe IO hubs */
 	probe_p7ioc();
@@ -1044,6 +1052,9 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 
 	prd_register_reserved_memory();
 
+	/* On P9, switch to radix mode by default */
+	cpu_set_radix_mode();
+
 	load_and_boot_kernel(false);
 }
 
@@ -1053,8 +1064,6 @@ void __noreturn __secondary_cpu_entry(void)
 
 	/* Secondary CPU called in */
 	cpu_callin(cpu);
-
-	init_hid();
 
 	/* Some XIVE setup */
 	xive_cpu_callin(cpu);
