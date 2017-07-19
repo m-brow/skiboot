@@ -967,6 +967,7 @@ static void pci_reset_phb(void *data)
 	pci_slot_add_flags(slot, PCI_SLOT_FLAG_BOOTUP);
 	rc = slot->ops.freset(slot);
 	while (rc > 0) {
+		PCITRACE(phb, 0, "Waiting %ld ms\n", tb_to_msecs(rc));
 		time_wait(rc);
 		rc = slot->ops.run_sm(slot);
 	}
@@ -1737,7 +1738,7 @@ void pci_init_slots(void)
 	if (platform.pre_pci_fixup)
 		platform.pre_pci_fixup();
 
-	prlog(PR_INFO, "PCI: Resetting PHBs...\n");
+	prlog(PR_NOTICE, "PCI: Resetting PHBs and training links...\n");
 	pci_do_jobs(pci_reset_phb);
 
 	prlog(PR_NOTICE, "PCI: Probing slots...\n");

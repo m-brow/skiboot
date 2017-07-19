@@ -1,4 +1,4 @@
-/* Copyright 2013-2014 IBM Corp.
+/* Copyright 2013-2017 IBM Corp.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1191,12 +1191,21 @@ static int64_t opal_reinit_cpus(uint64_t flags)
 			else
 				req.clr_bits |= SPR_HID0_POWER9_RADIX;
 
-			cleanup_global_tlb();
 			current_radix_mode = radix;
 		}
 	}
 
-	/* Apply HID bits changes if any */
+	/* Cleanup the TLB. We do that unconditionally, this works
+	 * around issues where OSes fail to invalidate the PWC in Radix
+	 * mode for example. This only works on P9 and later, but we
+	 * also know we don't have a problem with Linux cleanups on
+	 * P8 so this isn't a problem. If we wanted to cleanup the
+	 * TLB on P8 as well, we'd have to use jobs to do it locally
+	 * on each CPU.
+	 */
+	 cleanup_global_tlb();
+
+	 /* Apply HID bits changes if any */
 	if (req.set_bits || req.clr_bits)
 		cpu_change_all_hid0(&req);
 
@@ -1207,8 +1216,8 @@ static int64_t opal_reinit_cpus(uint64_t flags)
 		flags &= ~(OPAL_REINIT_CPUS_HILE_BE | OPAL_REINIT_CPUS_HILE_LE);
 	}
 
-	/* Any flags left ? */
-	if (flags != 0 && proc_gen == proc_gen_p8)
+	/* Handle P8 DD1 SLW reinit */
+	if (flags != 0 && proc_gen == proc_gen_p8 && !hile_supported)
 		rc = slw_reinit(flags);
 	else if (flags != 0)
 		rc = OPAL_UNSUPPORTED;
