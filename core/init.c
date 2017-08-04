@@ -45,6 +45,7 @@
 #include <sensor.h>
 #include <xive.h>
 #include <nvram.h>
+#include <vas.h>
 #include <libstb/stb.h>
 #include <libstb/container.h>
 #include <phys-map.h>
@@ -507,6 +508,7 @@ void __noreturn load_and_boot_kernel(bool is_reboot)
 	 * as possible to avoid delay.
 	 */
 	occ_pstates_init();
+	occ_sensors_init();
 
 	/* Use nvram bootargs over device tree */
 	cmdline = nvram_query("bootargs");
@@ -1000,6 +1002,9 @@ void __noreturn __nomcount main_cpu_entry(const void *fdt)
 	preload_io_vpd();
 	preload_capp_ucode();
 	start_preload_kernel();
+
+	/* Virtual Accelerator Switchboard */
+	vas_init();
 
 	/* NX init */
 	nx_init();

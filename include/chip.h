@@ -98,6 +98,10 @@
 
 #define P9_PIR2THREADID(pir) ((pir) & 0x3)
 
+#define P9_GCID2NODEID(gcid)	(((gcid) >> 3) & 0xf)
+
+#define P9_GCID2CHIPID(gcid) ((gcid) & 0x7)
+
 /* P9 specific ones mostly used by XIVE */
 #define P9_PIR2LOCALCPU(pir) ((pir) & 0xff)
 #define P9_PIRFROMLOCALCPU(chip, cpu)	(((chip) << 8) | (cpu))
@@ -108,6 +112,7 @@ struct centaur_chip;
 struct mfsi;
 struct xive;
 struct lpcm;
+struct vas;
 
 /* Chip type */
 enum proc_chip_type {
@@ -208,6 +213,8 @@ struct proc_chip {
 
 	/* Used by hw/xive.c */
 	struct xive		*xive;
+
+	struct vas		*vas;
 };
 
 extern uint32_t pir_to_chip_id(uint32_t pir);

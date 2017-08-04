@@ -27,6 +27,66 @@
  *	- Directly detect fenced PHB through one dedicated HW reg
  */
 
+/*
+ * This is a simplified view of the PHB4 reset and link training steps
+ *
+ * Step 1:
+ * - Check for hotplug status:
+ *  o PHB_PCIE_HOTPLUG_STATUS bit PHB_PCIE_HPSTAT_PRESENCE
+ *  o If not set -> Bail out (Slot is empty)
+ *
+ * Step 2:
+ * - Do complete PHB reset:
+ *   o PHB/ETU reset procedure
+ *
+ * Step 3:
+ * - Drive PERST active (skip if already asserted. ie. after cold reboot)
+ * - Wait 250ms (for cards to reset)
+ *   o powervm have used 250ms for a long time without any problems
+ *
+ * Step 4:
+ * - Drive PERST inactive
+ *
+ * Step 5:
+ * - Look for inband presence:
+ *   o From PERST we have two stages to get inband presence detected
+ *     1) Devices must enter Detect state within 20 ms of the end of
+ *          Fundamental Reset
+ *     2) Receiver detect pulse are every 12ms
+ *      - Hence minimum wait time 20 + 12 = 32ms
+ *   o Unfortunatey, we've seen cards take 440ms
+ *   o Hence we are conservative and poll here for 1000ms (> 440ms)
+ * - If no inband presence after 100ms -> Bail out (Slot is broken)
+ *   o PHB_PCIE_DLP_TRAIN_CTL bit PHB_PCIE_DLP_INBAND_PRESENCE
+ *
+ * Step 6:
+ * - Look for link training done:
+ *   o PHB_PCIE_DLP_TRAIN_CTL bit PHB_PCIE_DLP_TL_LINKACT
+ * - If not set after 2000ms, Retry (3 times) -> Goto Step 2
+ *   o phy lockup could link training failure, hence going back to a
+ *     complete PHB reset on retry
+ *   o not expect to happen very often
+ *
+ * Step 7:
+ * - Wait for 1 sec (before touching device config space):
+ * -  From PCIe spec:
+ *     Root Complex and/or system software must allow at least 1.0 s after
+ *     a Conventional Reset of a device, before it may determine that a
+ *     device which fails to return a Successful Completion status for a
+ *     valid Configuration Request is a broken device.
+ *
+ * Step 8:
+ * - Sanity check for fence and link still up:
+ *   o If fenced or link down, Retry (3 times) -> Goto Step 2
+ *   o This is not nessary but takes no time and can be useful
+ *   o Once we leave here, much harder to recover from errors
+ *
+ * Step 9:
+ *  - PHB good, start probing config space.
+ *    o core/pci.c: pci_reset_phb() -> pci_scan_phb()
+ */
+
+
 #undef NO_ASB
 #undef LOG_CFG
 
@@ -61,7 +121,6 @@
 #define DISABLE_ERR_INTS
 
 static void phb4_init_hw(struct phb4 *p, bool first_init);
-static bool phb4_init_rc_cfg(struct phb4 *p);
 
 #define PHBDBG(p, fmt, a...)	prlog(PR_DEBUG, "PHB#%04x[%d:%d]: " fmt, \
 				      (p)->phb.opal_id, (p)->chip_id, \
@@ -80,6 +139,7 @@ static bool phb4_init_rc_cfg(struct phb4 *p);
 #endif
 
 static bool verbose_eeh;
+static bool pci_tracing;
 
 enum capi_dma_tvt {
 	CAPI_DMA_TVT0,
@@ -179,131 +239,6 @@ static inline void phb4_ioda_sel(struct phb4 *p, uint32_t table,
 		       (autoinc ? PHB_IODA_AD_AUTOINC : 0)	|
 		       SETFIELD(PHB_IODA_AD_TSEL, 0ul, table)	|
 		       SETFIELD(PHB_IODA_AD_TADR, 0ul, addr));
-}
-
-static void phb4_read_phb_status(struct phb4 *p,
-				 struct OpalIoPhb4ErrorData *stat);
-static void phb4_eeh_dump_regs(struct phb4 *p)
-{
-	struct OpalIoPhb4ErrorData *s;
-	unsigned int i;
-
-	s = zalloc(sizeof(struct OpalIoPhb4ErrorData));
-	phb4_read_phb_status(p, s);
-
-	PHBERR(p, "brdgCtl        = %08x\n", s->brdgCtl);
-
-	/* PHB4 cfg regs */
-	PHBERR(p, "            deviceStatus = %08x\n", s->deviceStatus);
-	PHBERR(p, "              slotStatus = %08x\n", s->slotStatus);
-	PHBERR(p, "              linkStatus = %08x\n", s->linkStatus);
-	PHBERR(p, "            devCmdStatus = %08x\n", s->devCmdStatus);
-	PHBERR(p, "            devSecStatus = %08x\n", s->devSecStatus);
-	PHBERR(p, "         rootErrorStatus = %08x\n", s->rootErrorStatus);
-	PHBERR(p, "       uncorrErrorStatus = %08x\n", s->uncorrErrorStatus);
-	PHBERR(p, "         corrErrorStatus = %08x\n", s->corrErrorStatus);
-	PHBERR(p, "       uncorrErrorStatus = %08x\n", s->uncorrErrorStatus);
-	PHBERR(p, "                 tlpHdr1 = %08x\n", s->tlpHdr1);
-	PHBERR(p, "                 tlpHdr2 = %08x\n", s->tlpHdr2);
-	PHBERR(p, "                 tlpHdr3 = %08x\n", s->tlpHdr3);
-	PHBERR(p, "                 tlpHdr4 = %08x\n", s->tlpHdr4);
-	PHBERR(p, "                sourceId = %08x\n", s->sourceId);
-	PHBERR(p, "                 tlpHdr1 = %08x\n", s->tlpHdr1);
-	PHBERR(p, "                    nFir = %016llx\n", s->nFir);
-	PHBERR(p, "                nFirMask = %016llx\n", s->nFirMask);
-	PHBERR(p, "                 nFirWOF = %016llx\n", s->nFirWOF);
-	PHBERR(p, "                phbPlssr = %016llx\n", s->phbPlssr);
-	PHBERR(p, "                  phbCsr = %016llx\n", s->phbCsr);
-	PHBERR(p, "                  lemFir = %016llx\n", s->lemFir);
-	PHBERR(p, "            lemErrorMask = %016llx\n", s->lemErrorMask);
-	PHBERR(p, "                  lemWOF = %016llx\n", s->lemWOF);
-	PHBERR(p, "          phbErrorStatus = %016llx\n", s->phbErrorStatus);
-	PHBERR(p, "     phbFirstErrorStatus = %016llx\n", s->phbFirstErrorStatus);
-	PHBERR(p, "            phbErrorLog0 = %016llx\n", s->phbErrorLog0);
-	PHBERR(p, "            phbErrorLog1 = %016llx\n", s->phbErrorLog1);
-	PHBERR(p, "       phbTxeErrorStatus = %016llx\n", s->phbTxeErrorStatus);
-	PHBERR(p, "  phbTxeFirstErrorStatus = %016llx\n", s->phbTxeFirstErrorStatus);
-	PHBERR(p, "         phbTxeErrorLog0 = %016llx\n", s->phbTxeErrorLog0);
-	PHBERR(p, "         phbTxeErrorLog1 = %016llx\n", s->phbTxeErrorLog1);
-	PHBERR(p, "    phbRxeArbErrorStatus = %016llx\n", s->phbRxeArbErrorStatus);
-	PHBERR(p, "phbRxeArbFrstErrorStatus = %016llx\n", s->phbRxeArbFirstErrorStatus);
-	PHBERR(p, "      phbRxeArbErrorLog0 = %016llx\n", s->phbRxeArbErrorLog0);
-	PHBERR(p, "      phbRxeArbErrorLog1 = %016llx\n", s->phbRxeArbErrorLog1);
-	PHBERR(p, "    phbRxeMrgErrorStatus = %016llx\n", s->phbRxeMrgErrorStatus);
-	PHBERR(p, "phbRxeMrgFrstErrorStatus = %016llx\n", s->phbRxeMrgFirstErrorStatus);
-	PHBERR(p, "      phbRxeMrgErrorLog0 = %016llx\n", s->phbRxeMrgErrorLog0);
-	PHBERR(p, "      phbRxeMrgErrorLog1 = %016llx\n", s->phbRxeMrgErrorLog1);
-	PHBERR(p, "    phbRxeTceErrorStatus = %016llx\n", s->phbRxeTceErrorStatus);
-	PHBERR(p, "phbRxeTceFrstErrorStatus = %016llx\n", s->phbRxeTceFirstErrorStatus);
-	PHBERR(p, "      phbRxeTceErrorLog0 = %016llx\n", s->phbRxeTceErrorLog0);
-	PHBERR(p, "      phbRxeTceErrorLog1 = %016llx\n", s->phbRxeTceErrorLog1);
-	PHBERR(p, "       phbPblErrorStatus = %016llx\n", s->phbPblErrorStatus);
-	PHBERR(p, "  phbPblFirstErrorStatus = %016llx\n", s->phbPblFirstErrorStatus);
-	PHBERR(p, "         phbPblErrorLog0 = %016llx\n", s->phbPblErrorLog0);
-	PHBERR(p, "         phbPblErrorLog1 = %016llx\n", s->phbPblErrorLog1);
-	PHBERR(p, "     phbPcieDlpErrorLog1 = %016llx\n", s->phbPcieDlpErrorLog1);
-	PHBERR(p, "     phbPcieDlpErrorLog2 = %016llx\n", s->phbPcieDlpErrorLog2);
-	PHBERR(p, "   phbPcieDlpErrorStatus = %016llx\n", s->phbPcieDlpErrorStatus);
-
-	PHBERR(p, "      phbRegbErrorStatus = %016llx\n", s->phbRegbErrorStatus);
-	PHBERR(p, " phbRegbFirstErrorStatus = %016llx\n", s->phbRegbFirstErrorStatus);
-	PHBERR(p, "        phbRegbErrorLog0 = %016llx\n", s->phbRegbErrorLog0);
-	PHBERR(p, "        phbRegbErrorLog1 = %016llx\n", s->phbRegbErrorLog1);
-
-	for (i = 0; i < OPAL_PHB4_NUM_PEST_REGS; i++) {
-		if (!s->pestA[i] && !s->pestB[i])
-			continue;
-		PHBERR(p, "               PEST[%03d] = %016llx %016llx\n",
-		       i, s->pestA[i], s->pestB[i]);
-	}
-	free(s);
-}
-
-/* Check if AIB is fenced via PBCQ NFIR */
-static bool phb4_fenced(struct phb4 *p)
-{
-	uint64_t nfir_p, nfir_n, err_aib;
-	uint64_t err_rpt0, err_rpt1;
-
-	/* Already fenced ? */
-	if (p->flags & PHB4_AIB_FENCED)
-		return true;
-
-	/*
-	 * An all 1's from the PHB indicates a PHB freeze/fence. We
-	 * don't really differenciate them at this point.
-	 */
-	if (in_be64(p->regs + PHB_CPU_LOADSTORE_STATUS)!= 0xfffffffffffffffful)
-		return false;
-
-	PHBERR(p, "PHB Freeze/Fence detected !\n");
-
-	/* We read the PCI and NEST FIRs and dump them */
-	xscom_read(p->chip_id,
-		   p->pci_stk_xscom + XPEC_PCI_STK_PCI_FIR, &nfir_p);
-	xscom_read(p->chip_id,
-		   p->pe_stk_xscom + XPEC_NEST_STK_PCI_NFIR, &nfir_n);
-	xscom_read(p->chip_id,
-		   p->pe_stk_xscom + XPEC_NEST_STK_ERR_RPT0, &err_rpt0);
-	xscom_read(p->chip_id,
-		   p->pe_stk_xscom + XPEC_NEST_STK_ERR_RPT1, &err_rpt1);
-	xscom_read(p->chip_id,
-		   p->pci_stk_xscom + XPEC_PCI_STK_PBAIB_ERR_REPORT, &err_aib);
-
-	PHBERR(p, " PCI FIR=%016llx\n", nfir_p);
-	PHBERR(p, "NEST FIR=%016llx\n", nfir_n);
-	PHBERR(p, "ERR RPT0=%016llx\n", err_rpt0);
-	PHBERR(p, "ERR RPT1=%016llx\n", err_rpt1);
-	PHBERR(p, " AIB ERR=%016llx\n", err_aib);
-
-	/* Mark ourselves fenced */
-	p->flags |= PHB4_AIB_FENCED;
-	p->state = PHB4_STATE_FENCED;
-
-	if (verbose_eeh)
-		phb4_eeh_dump_regs(p);
-
-	return true;
 }
 
 /*
@@ -496,6 +431,8 @@ static int64_t phb4_pcicfg_read(struct phb4 *p, uint32_t bdfn,
 	if (p->flags & PHB4_AIB_FENCED) {
 		if (!(p->flags & PHB4_CFG_USE_ASB))
 			return OPAL_HARDWARE;
+		if (bdfn != 0)
+			return OPAL_HARDWARE;
 		use_asb = true;
 	} else if ((p->flags & PHB4_CFG_BLOCKED) && bdfn != 0) {
 		return OPAL_HARDWARE;
@@ -586,6 +523,8 @@ static int64_t phb4_pcicfg_write(struct phb4 *p, uint32_t bdfn,
 
 	if (p->flags & PHB4_AIB_FENCED) {
 		if (!(p->flags & PHB4_CFG_USE_ASB))
+			return OPAL_HARDWARE;
+		if (bdfn != 0)
 			return OPAL_HARDWARE;
 		use_asb = true;
 	} else if ((p->flags & PHB4_CFG_BLOCKED) && bdfn != 0) {
@@ -1724,6 +1663,45 @@ static int64_t phb4_get_msi_64(struct phb *phb,
 	return OPAL_SUCCESS;
 }
 
+static void phb4_rc_err_clear(struct phb4 *p)
+{
+	/* Init_47 - Clear errors */
+	phb4_pcicfg_write16(&p->phb, 0, PCI_CFG_SECONDARY_STATUS, 0xffff);
+
+	if (p->ecap <= 0)
+		return;
+
+	phb4_pcicfg_write16(&p->phb, 0, p->ecap + PCICAP_EXP_DEVSTAT,
+			     PCICAP_EXP_DEVSTAT_CE	|
+			     PCICAP_EXP_DEVSTAT_NFE	|
+			     PCICAP_EXP_DEVSTAT_FE	|
+			     PCICAP_EXP_DEVSTAT_UE);
+
+	if (p->aercap <= 0)
+		return;
+
+	/* Clear all UE status */
+	phb4_pcicfg_write32(&p->phb, 0, p->aercap + PCIECAP_AER_UE_STATUS,
+			     0xffffffff);
+	/* Clear all CE status */
+	phb4_pcicfg_write32(&p->phb, 0, p->aercap + PCIECAP_AER_CE_STATUS,
+			     0xffffffff);
+	/* Clear root error status */
+	phb4_pcicfg_write32(&p->phb, 0, p->aercap + PCIECAP_AER_RERR_STA,
+			     0xffffffff);
+}
+
+static void phb4_err_clear_regb(struct phb4 *p)
+{
+	uint64_t val64;
+
+	val64 = phb4_read_reg(p, PHB_REGB_ERR_STATUS);
+	phb4_write_reg(p, PHB_REGB_ERR_STATUS, val64);
+	phb4_write_reg(p, PHB_REGB_ERR1_STATUS, 0x0ul);
+	phb4_write_reg(p, PHB_REGB_ERR_LOG_0, 0x0ul);
+	phb4_write_reg(p, PHB_REGB_ERR_LOG_1, 0x0ul);
+}
+
 /*
  * The function can be called during error recovery for all classes of
  * errors.  This is new to PHB4; previous revisions had separate
@@ -1740,18 +1718,19 @@ static void phb4_err_clear(struct phb4 *p)
 	/* Rec 1: Acquire the PCI config lock (we don't need to do this) */
 
 	/* Rec 2...15: Clear error status in RC config space */
-	/* Reset steps are the same as the init sequence */
-	phb4_init_rc_cfg(p);
+	phb4_rc_err_clear(p);
 
-	/* Rec 16/17: Clear PBL errors */
+	/* Rec 16...23: Clear PBL errors */
 	val64 = phb4_read_reg(p, PHB_PBL_ERR_STATUS);
 	phb4_write_reg(p, PHB_PBL_ERR_STATUS, val64);
+	phb4_write_reg(p, PHB_PBL_ERR1_STATUS, 0x0ul);
+	phb4_write_reg(p, PHB_PBL_ERR_LOG_0, 0x0ul);
+	phb4_write_reg(p, PHB_PBL_ERR_LOG_1, 0x0ul);
 
-	/* Rec 18/19: Clear REGB errors */
-	val64 = phb4_read_reg(p, PHB_REGB_ERR_STATUS);
-	phb4_write_reg(p, PHB_REGB_ERR_STATUS, val64);
+	/* Rec 24...31: Clear REGB errors */
+	phb4_err_clear_regb(p);
 
-	/* Rec 20...59: Clear PHB error trap */
+	/* Rec 32...59: Clear PHB error trap */
 	val64 = phb4_read_reg(p, PHB_TXE_ERR_STATUS);
 	phb4_write_reg(p, PHB_TXE_ERR_STATUS, val64);
 	phb4_write_reg(p, PHB_TXE_ERR1_STATUS, 0x0ul);
@@ -1890,7 +1869,7 @@ static void phb4_read_phb_status(struct phb4 *p,
 	stat->phbPblErrorStatus = phb4_read_reg_asb(p, PHB_PBL_ERR_STATUS);
 	stat->phbPblFirstErrorStatus = phb4_read_reg_asb(p, PHB_PBL_ERR1_STATUS);
 	stat->phbPblErrorLog0 = phb4_read_reg_asb(p, PHB_PBL_ERR_LOG_0);
-	stat->phbPblErrorLog1 = phb4_read_reg_asb(p, PHB_PBL_ERR_LOG_0);
+	stat->phbPblErrorLog1 = phb4_read_reg_asb(p, PHB_PBL_ERR_LOG_1);
 
 	stat->phbPcieDlpErrorStatus = phb4_read_reg_asb(p, PHB_PCIE_DLP_ERR_STATUS);
 	stat->phbPcieDlpErrorLog1 = phb4_read_reg_asb(p, PHB_PCIE_DLP_ERRLOG1);
@@ -1922,6 +1901,95 @@ static void phb4_read_phb_status(struct phb4 *p,
 		 stat->pestB[i] = phb4_read_reg_asb(p, PHB_IODA_DATA0);
 		 stat->pestB[i] |= pPEST[2 * i + 1];
 	 }
+}
+
+static void phb4_eeh_dump_regs(struct phb4 *p)
+{
+	struct OpalIoPhb4ErrorData *s;
+	uint32_t reg;
+	unsigned int i;
+
+	if (!verbose_eeh)
+		return;
+
+	s = zalloc(sizeof(struct OpalIoPhb4ErrorData));
+	phb4_read_phb_status(p, s);
+
+
+	PHBERR(p, "brdgCtl        = %08x\n", s->brdgCtl);
+
+	/* PHB4 cfg regs */
+	PHBERR(p, "            deviceStatus = %08x\n", s->deviceStatus);
+	PHBERR(p, "              slotStatus = %08x\n", s->slotStatus);
+	PHBERR(p, "              linkStatus = %08x\n", s->linkStatus);
+	PHBERR(p, "            devCmdStatus = %08x\n", s->devCmdStatus);
+	PHBERR(p, "            devSecStatus = %08x\n", s->devSecStatus);
+	PHBERR(p, "         rootErrorStatus = %08x\n", s->rootErrorStatus);
+	PHBERR(p, "       uncorrErrorStatus = %08x\n", s->uncorrErrorStatus);
+	PHBERR(p, "         corrErrorStatus = %08x\n", s->corrErrorStatus);
+	PHBERR(p, "       uncorrErrorStatus = %08x\n", s->uncorrErrorStatus);
+
+	/* Two non OPAL API registers that are useful */
+	phb4_pcicfg_read32(&p->phb, 0, p->ecap + PCICAP_EXP_DEVCTL, &reg);
+	PHBERR(p, "                  devctl = %08x\n", reg);
+	phb4_pcicfg_read32(&p->phb, 0, p->ecap + PCICAP_EXP_DEVSTAT,
+			   &reg);
+	PHBERR(p, "                 devStat = %08x\n", reg);
+
+	/* Byte swap TLP headers so they are the same as the PCIe spec */
+	PHBERR(p, "                 tlpHdr1 = %08x\n", bswap_32(s->tlpHdr1));
+	PHBERR(p, "                 tlpHdr2 = %08x\n", bswap_32(s->tlpHdr2));
+	PHBERR(p, "                 tlpHdr3 = %08x\n", bswap_32(s->tlpHdr3));
+	PHBERR(p, "                 tlpHdr4 = %08x\n", bswap_32(s->tlpHdr4));
+	PHBERR(p, "                sourceId = %08x\n", s->sourceId);
+	PHBERR(p, "                    nFir = %016llx\n", s->nFir);
+	PHBERR(p, "                nFirMask = %016llx\n", s->nFirMask);
+	PHBERR(p, "                 nFirWOF = %016llx\n", s->nFirWOF);
+	PHBERR(p, "                phbPlssr = %016llx\n", s->phbPlssr);
+	PHBERR(p, "                  phbCsr = %016llx\n", s->phbCsr);
+	PHBERR(p, "                  lemFir = %016llx\n", s->lemFir);
+	PHBERR(p, "            lemErrorMask = %016llx\n", s->lemErrorMask);
+	PHBERR(p, "                  lemWOF = %016llx\n", s->lemWOF);
+	PHBERR(p, "          phbErrorStatus = %016llx\n", s->phbErrorStatus);
+	PHBERR(p, "     phbFirstErrorStatus = %016llx\n", s->phbFirstErrorStatus);
+	PHBERR(p, "            phbErrorLog0 = %016llx\n", s->phbErrorLog0);
+	PHBERR(p, "            phbErrorLog1 = %016llx\n", s->phbErrorLog1);
+	PHBERR(p, "       phbTxeErrorStatus = %016llx\n", s->phbTxeErrorStatus);
+	PHBERR(p, "  phbTxeFirstErrorStatus = %016llx\n", s->phbTxeFirstErrorStatus);
+	PHBERR(p, "         phbTxeErrorLog0 = %016llx\n", s->phbTxeErrorLog0);
+	PHBERR(p, "         phbTxeErrorLog1 = %016llx\n", s->phbTxeErrorLog1);
+	PHBERR(p, "    phbRxeArbErrorStatus = %016llx\n", s->phbRxeArbErrorStatus);
+	PHBERR(p, "phbRxeArbFrstErrorStatus = %016llx\n", s->phbRxeArbFirstErrorStatus);
+	PHBERR(p, "      phbRxeArbErrorLog0 = %016llx\n", s->phbRxeArbErrorLog0);
+	PHBERR(p, "      phbRxeArbErrorLog1 = %016llx\n", s->phbRxeArbErrorLog1);
+	PHBERR(p, "    phbRxeMrgErrorStatus = %016llx\n", s->phbRxeMrgErrorStatus);
+	PHBERR(p, "phbRxeMrgFrstErrorStatus = %016llx\n", s->phbRxeMrgFirstErrorStatus);
+	PHBERR(p, "      phbRxeMrgErrorLog0 = %016llx\n", s->phbRxeMrgErrorLog0);
+	PHBERR(p, "      phbRxeMrgErrorLog1 = %016llx\n", s->phbRxeMrgErrorLog1);
+	PHBERR(p, "    phbRxeTceErrorStatus = %016llx\n", s->phbRxeTceErrorStatus);
+	PHBERR(p, "phbRxeTceFrstErrorStatus = %016llx\n", s->phbRxeTceFirstErrorStatus);
+	PHBERR(p, "      phbRxeTceErrorLog0 = %016llx\n", s->phbRxeTceErrorLog0);
+	PHBERR(p, "      phbRxeTceErrorLog1 = %016llx\n", s->phbRxeTceErrorLog1);
+	PHBERR(p, "       phbPblErrorStatus = %016llx\n", s->phbPblErrorStatus);
+	PHBERR(p, "  phbPblFirstErrorStatus = %016llx\n", s->phbPblFirstErrorStatus);
+	PHBERR(p, "         phbPblErrorLog0 = %016llx\n", s->phbPblErrorLog0);
+	PHBERR(p, "         phbPblErrorLog1 = %016llx\n", s->phbPblErrorLog1);
+	PHBERR(p, "     phbPcieDlpErrorLog1 = %016llx\n", s->phbPcieDlpErrorLog1);
+	PHBERR(p, "     phbPcieDlpErrorLog2 = %016llx\n", s->phbPcieDlpErrorLog2);
+	PHBERR(p, "   phbPcieDlpErrorStatus = %016llx\n", s->phbPcieDlpErrorStatus);
+
+	PHBERR(p, "      phbRegbErrorStatus = %016llx\n", s->phbRegbErrorStatus);
+	PHBERR(p, " phbRegbFirstErrorStatus = %016llx\n", s->phbRegbFirstErrorStatus);
+	PHBERR(p, "        phbRegbErrorLog0 = %016llx\n", s->phbRegbErrorLog0);
+	PHBERR(p, "        phbRegbErrorLog1 = %016llx\n", s->phbRegbErrorLog1);
+
+	for (i = 0; i < OPAL_PHB4_NUM_PEST_REGS; i++) {
+		if (!s->pestA[i] && !s->pestB[i])
+			continue;
+		PHBERR(p, "               PEST[%03d] = %016llx %016llx\n",
+		       i, s->pestA[i], s->pestB[i]);
+	}
+	free(s);
 }
 
 static int64_t phb4_set_pe(struct phb *phb,
@@ -2166,8 +2234,23 @@ static int64_t phb4_retry_state(struct pci_slot *slot)
 {
 	struct phb4 *p = phb_to_phb4(slot->phb);
 
+	/* Mark link as down */
+	phb4_prepare_link_change(slot, false);
+
 	if (!slot->link_retries--) {
-		PHBERR(p, "Link detected but won't train\n");
+		switch (slot->state) {
+		case PHB4_SLOT_LINK_WAIT_ELECTRICAL:
+			PHBERR(p, "Presence detected but no electrical link\n");
+			break;
+		case PHB4_SLOT_LINK_WAIT:
+			PHBERR(p, "Electrical link detected but won't train\n");
+			break;
+		case PHB4_SLOT_LINK_STABLE:
+			PHBERR(p, "Linked trained but wasn't stable\n");
+			break;
+		default:
+			PHBERR(p, "Unknown link issue\n");
+		}
 		return OPAL_HARDWARE;
 	}
 
@@ -2175,11 +2258,115 @@ static int64_t phb4_retry_state(struct pci_slot *slot)
 	return pci_slot_set_sm_timeout(slot, msecs_to_tb(1));
 }
 
+static void phb4_train_info(struct phb4 *p, uint64_t reg, unsigned long time)
+{
+	char s[80];
+
+	snprintf(s, sizeof(s), "TRACE: 0x%016llx % 2lims",
+		 reg, tb_to_msecs(time));
+
+	if (reg & PHB_PCIE_DLP_TL_LINKACT)
+		snprintf(s, sizeof(s), "%s trained", s);
+	else if (reg & PHB_PCIE_DLP_TRAINING)
+		snprintf(s, sizeof(s), "%s training", s);
+	else if (reg & PHB_PCIE_DLP_INBAND_PRESENCE)
+		snprintf(s, sizeof(s), "%s presence", s);
+
+	PHBERR(p, "%s\n", s);
+}
+
+/* Check if AIB is fenced via PBCQ NFIR */
+static bool phb4_fenced(struct phb4 *p)
+{
+	uint64_t nfir_p, nfir_n, err_aib;
+	uint64_t err_rpt0, err_rpt1;
+
+	/* Already fenced ? */
+	if (p->flags & PHB4_AIB_FENCED)
+		return true;
+
+	/*
+	 * An all 1's from the PHB indicates a PHB freeze/fence. We
+	 * don't really differenciate them at this point.
+	 */
+	if (in_be64(p->regs + PHB_CPU_LOADSTORE_STATUS)!= 0xfffffffffffffffful)
+		return false;
+
+	PHBERR(p, "PHB Freeze/Fence detected !\n");
+
+	/* We read the PCI and NEST FIRs and dump them */
+	xscom_read(p->chip_id,
+		   p->pci_stk_xscom + XPEC_PCI_STK_PCI_FIR, &nfir_p);
+	xscom_read(p->chip_id,
+		   p->pe_stk_xscom + XPEC_NEST_STK_PCI_NFIR, &nfir_n);
+	xscom_read(p->chip_id,
+		   p->pe_stk_xscom + XPEC_NEST_STK_ERR_RPT0, &err_rpt0);
+	xscom_read(p->chip_id,
+		   p->pe_stk_xscom + XPEC_NEST_STK_ERR_RPT1, &err_rpt1);
+	xscom_read(p->chip_id,
+		   p->pci_stk_xscom + XPEC_PCI_STK_PBAIB_ERR_REPORT, &err_aib);
+
+	PHBERR(p, " PCI FIR=%016llx\n", nfir_p);
+	PHBERR(p, "NEST FIR=%016llx\n", nfir_n);
+	PHBERR(p, "ERR RPT0=%016llx\n", err_rpt0);
+	PHBERR(p, "ERR RPT1=%016llx\n", err_rpt1);
+	PHBERR(p, " AIB ERR=%016llx\n", err_aib);
+
+	/* Mark ourselves fenced */
+	p->flags |= PHB4_AIB_FENCED;
+	p->state = PHB4_STATE_FENCED;
+
+	phb4_eeh_dump_regs(p);
+
+	return true;
+}
+
+static bool phb4_check_reg(struct phb4 *p, uint64_t reg)
+{
+	if (reg == 0xffffffffffffffffUL)
+		return !phb4_fenced(p);
+	return true;
+}
+
+/*
+ * This is a trace function to watch what's happening duing pcie link
+ * training.  If any errors are detected it simply returns so the
+ * normal code can deal with it.
+ */
+static void phb4_training_trace(struct phb4 *p)
+{
+	uint64_t reg, reglast = -1;
+	unsigned long now, start = mftb();
+
+	if (!pci_tracing)
+		return;
+
+	while(1) {
+		now = mftb();
+		reg = in_be64(p->regs + PHB_PCIE_DLP_TRAIN_CTL);
+		if (reg != reglast)
+			phb4_train_info(p, reg, now - start);
+		reglast = reg;
+
+		if (!phb4_check_reg(p, reg)) {
+			PHBERR(p, "TRACE: PHB fence waiting link.\n");
+			break;
+		}
+		if (reg & PHB_PCIE_DLP_TL_LINKACT) {
+			PHBERR(p, "TRACE: Link trained.\n");
+			break;
+		}
+		if ((now - start) > secs_to_tb(3)) {
+			PHBERR(p, "TRACE: Timeout waiting for link up.\n");
+			break;
+		}
+	}
+}
+
 static int64_t phb4_poll_link(struct pci_slot *slot)
 {
 	struct phb4 *p = phb_to_phb4(slot->phb);
 	uint64_t reg;
-	int64_t rc;
 
 	switch (slot->state) {
 	case PHB4_SLOT_NORMAL:
@@ -2187,7 +2374,8 @@ static int64_t phb4_poll_link(struct pci_slot *slot)
 		PHBDBG(p, "LINK: Start polling\n");
 		slot->retries = PHB4_LINK_ELECTRICAL_RETRIES;
 		pci_slot_set_state(slot, PHB4_SLOT_LINK_WAIT_ELECTRICAL);
-		return pci_slot_set_sm_timeout(slot, msecs_to_tb(100));
+		/* Polling early here has no chance of a false positive */
+		return pci_slot_set_sm_timeout(slot, msecs_to_tb(1));
 	case PHB4_SLOT_LINK_WAIT_ELECTRICAL:
 		/*
 		 * Wait for the link electrical connection to be
@@ -2200,46 +2388,73 @@ static int64_t phb4_poll_link(struct pci_slot *slot)
 		 * link bit at all
 		 */
 		reg = in_be64(p->regs + PHB_PCIE_DLP_TRAIN_CTL);
+		if (!phb4_check_reg(p, reg)) {
+			PHBERR(p, "PHB fence waiting for electrical link\n");
+			return phb4_retry_state(slot);
+		}
+
 		if (reg & (PHB_PCIE_DLP_INBAND_PRESENCE |
 			   PHB_PCIE_DLP_TL_LINKACT)) {
 			PHBDBG(p, "LINK: Electrical link detected\n");
 			pci_slot_set_state(slot, PHB4_SLOT_LINK_WAIT);
 			slot->retries = PHB4_LINK_WAIT_RETRIES;
-			return pci_slot_set_sm_timeout(slot, msecs_to_tb(100));
+			/* No wait here since already have an elec link */
+			return pci_slot_set_sm_timeout(slot, msecs_to_tb(1));
 		}
 
 		if (slot->retries-- == 0) {
-			PHBDBG(p, "LINK: Timeout waiting for electrical link\n");
+			PHBERR(p, "LINK: Timeout waiting for electrical link\n");
 			PHBDBG(p, "LINK: DLP train control: 0x%016llx\n", reg);
-			rc = phb4_retry_state(slot);
-			if (rc >= OPAL_SUCCESS)
-				return rc;
-
-			pci_slot_set_state(slot, PHB4_SLOT_NORMAL);
-			return OPAL_SUCCESS;
+			return OPAL_HARDWARE;
 		}
-		return pci_slot_set_sm_timeout(slot, msecs_to_tb(100));
+		/* Retry */
+		return pci_slot_set_sm_timeout(slot, msecs_to_tb(10));
 	case PHB4_SLOT_LINK_WAIT:
 		reg = in_be64(p->regs + PHB_PCIE_DLP_TRAIN_CTL);
+		if (!phb4_check_reg(p, reg)) {
+			PHBERR(p, "LINK: PHB fence waiting for link training\n");
+			return phb4_retry_state(slot);
+		}
 		if (reg & PHB_PCIE_DLP_TL_LINKACT) {
 			PHBDBG(p, "LINK: Link is up\n");
-			if (slot->ops.prepare_link_change)
-				slot->ops.prepare_link_change(slot, true);
-			pci_slot_set_state(slot, PHB4_SLOT_NORMAL);
-			return OPAL_SUCCESS;
+			phb4_prepare_link_change(slot, true);
+			pci_slot_set_state(slot, PHB4_SLOT_LINK_STABLE);
+			slot->stable_retries = PHB4_LINK_STABLE_RETRIES;
+			return pci_slot_set_sm_timeout(slot, secs_to_tb(1));
 		}
 
 		if (slot->retries-- == 0) {
-			PHBDBG(p, "LINK: Timeout waiting for link up\n");
+			PHBERR(p, "LINK: Timeout waiting for link up\n");
 			PHBDBG(p, "LINK: DLP train control: 0x%016llx\n", reg);
-			rc = phb4_retry_state(slot);
-			if (rc >= OPAL_SUCCESS)
-				return rc;
+			return phb4_retry_state(slot);
+		}
+		/* Retry */
+		return pci_slot_set_sm_timeout(slot, msecs_to_tb(10));
+	case PHB4_SLOT_LINK_STABLE:
+		/* Sanity check link */
+		if (phb4_fenced(p)) {
+			PHBERR(p, "LINK: PHB fenced waiting for stabilty\n");
+			return phb4_retry_state(slot);
+		}
+		reg = in_be64(p->regs + PHB_PCIE_DLP_TRAIN_CTL);
+		if (!phb4_check_reg(p, reg)) {
+			PHBERR(p, "LINK: PHB fence reading training control\n");
+			return phb4_retry_state(slot);
+		}
+		if (reg & PHB_PCIE_DLP_TL_LINKACT) {
+			PHBDBG(p, "LINK: Link is stable\n");
+			if (slot->stable_retries--) {
+				PHBDBG(p, "LINK: Doing retry: %lli\n",
+				       slot->stable_retries);
+				return pci_slot_set_sm_timeout(slot, secs_to_tb(1));
+			}
 
 			pci_slot_set_state(slot, PHB4_SLOT_NORMAL);
 			return OPAL_SUCCESS;
 		}
-		return pci_slot_set_sm_timeout(slot, msecs_to_tb(100));
+		PHBERR(p, "LINK: Went down waiting for stabilty\n");
+		PHBDBG(p, "LINK: DLP train control: 0x%016llx\n", reg);
+		return phb4_retry_state(slot);
 	default:
 		PHBERR(p, "LINK: Unexpected slot state %08x\n",
 		       slot->state);
@@ -2266,8 +2481,7 @@ static int64_t phb4_hreset(struct pci_slot *slot)
 		}
 
 		PHBDBG(p, "HRESET: Prepare for link down\n");
-		if (slot->ops.prepare_link_change)
-			slot->ops.prepare_link_change(slot, false);
+		phb4_prepare_link_change(slot, false);
 		/* fall through */
 	case PHB4_SLOT_HRESET_START:
 		PHBDBG(p, "HRESET: Assert\n");
@@ -2280,6 +2494,9 @@ static int64_t phb4_hreset(struct pci_slot *slot)
 		return pci_slot_set_sm_timeout(slot, secs_to_tb(1));
 	case PHB4_SLOT_HRESET_DELAY:
 		PHBDBG(p, "HRESET: Deassert\n");
+
+		/* Clear link errors before we deassert reset */
+		phb4_err_clear_regb(p);
 
 		phb4_pcicfg_read16(&p->phb, 0, PCI_CFG_BRCTL, &brctl);
 		brctl &= ~PCI_CFG_BRCTL_SECONDARY_RESET;
@@ -2325,8 +2542,7 @@ static int64_t phb4_freset(struct pci_slot *slot)
 
 		PHBDBG(p, "FRESET: Prepare for link down\n");
 
-		if (slot->ops.prepare_link_change)
-			slot->ops.prepare_link_change(slot, false);
+		phb4_prepare_link_change(slot, false);
 		/* fall through */
 	case PHB4_SLOT_FRESET_START:
 		if (!p->skip_perst) {
@@ -2336,7 +2552,8 @@ static int64_t phb4_freset(struct pci_slot *slot)
 			out_be64(p->regs + PHB_PCIE_CRESET, reg);
 			pci_slot_set_state(slot,
 				PHB4_SLOT_FRESET_ASSERT_DELAY);
-			return pci_slot_set_sm_timeout(slot, secs_to_tb(1));
+			/* 250ms assert time aligns with powernv */
+			return pci_slot_set_sm_timeout(slot, msecs_to_tb(250));
 		}
 
 		/* To skip the assert during boot time */
@@ -2345,6 +2562,9 @@ static int64_t phb4_freset(struct pci_slot *slot)
 		p->skip_perst = false;
 		/* fall through */
 	case PHB4_SLOT_FRESET_ASSERT_DELAY:
+		/* Clear link errors before we deassert PERST */
+		phb4_err_clear_regb(p);
+
 		PHBDBG(p, "FRESET: Deassert\n");
 		reg = in_be64(p->regs + PHB_PCIE_CRESET);
 		reg |= PHB_PCIE_CRESET_PERST_N;
@@ -2352,8 +2572,10 @@ static int64_t phb4_freset(struct pci_slot *slot)
 		pci_slot_set_state(slot,
 			PHB4_SLOT_FRESET_DEASSERT_DELAY);
 
-		/* CAPP FPGA requires 1s to flash before polling link */
-		return pci_slot_set_sm_timeout(slot, secs_to_tb(1));
+		phb4_training_trace(p);
+
+		/* Move on to link poll right away */
+		return pci_slot_set_sm_timeout(slot, msecs_to_tb(1));
 	case PHB4_SLOT_FRESET_DEASSERT_DELAY:
 		pci_slot_set_state(slot, PHB4_SLOT_LINK_START);
 		return slot->ops.poll_link(slot);
@@ -2385,7 +2607,7 @@ static int64_t load_capp_ucode(struct phb4 *p)
 static int64_t phb4_creset(struct pci_slot *slot)
 {
 	struct phb4 *p = phb_to_phb4(slot->phb);
-	uint64_t pbcq_status;
+	uint64_t pbcq_status, reg;
 
 	switch (slot->state) {
 	case PHB4_SLOT_NORMAL:
@@ -2410,7 +2632,12 @@ static int64_t phb4_creset(struct pci_slot *slot)
 		 * Force use of ASB for register access until the PHB has
 		 * been fully reset.
 		 */
-		p->flags |= PHB4_CFG_USE_ASB;
+		p->flags |= PHB4_CFG_USE_ASB | PHB4_AIB_FENCED;
+
+		/* Assert PREST before clearing errors */
+		reg = phb4_read_reg(p, PHB_PCIE_CRESET);
+		reg &= ~PHB_PCIE_CRESET_PERST_N;
+		phb4_write_reg(p, PHB_PCIE_CRESET, reg);
 
 		/* Clear errors, following the proper sequence */
 		phb4_err_clear(p);
@@ -2448,7 +2675,8 @@ static int64_t phb4_creset(struct pci_slot *slot)
 			phb4_write_reg(p, PHB_IODA_DATA0, 0);
 
 			pci_slot_set_state(slot, PHB4_SLOT_CRESET_REINIT);
-			return pci_slot_set_sm_timeout(slot, msecs_to_tb(100));
+			/* After lifting PHB reset, wait while logic settles */
+			return pci_slot_set_sm_timeout(slot, msecs_to_tb(10));
 		}
 
 		if (slot->retries-- == 0) {
@@ -3000,7 +3228,7 @@ static int64_t phb4_get_diag_data(struct phb *phb,
 	phb4_fenced(p);
 	phb4_read_phb_status(p, data);
 
-	if (verbose_eeh && !(p->flags & PHB4_AIB_FENCED))
+	if (!(p->flags & PHB4_AIB_FENCED))
 		phb4_eeh_dump_regs(p);
 
 	/*
@@ -3499,7 +3727,7 @@ static bool phb4_init_rc_cfg(struct phb4 *p)
 	phb4_pcicfg_write32(&p->phb, 0, PCI_CFG_PRIMARY_BUS, 0x00ff0100);
 
 	/* Init_47 - Clear errors */
-	phb4_pcicfg_write16(&p->phb, 0, PCI_CFG_SECONDARY_STATUS, 0xffff);
+	/* see phb4_rc_err_clear() called below */
 
 	/* Init_48
 	 *
@@ -3524,12 +3752,6 @@ static bool phb4_init_rc_cfg(struct phb4 *p)
 	} else {
 		ecap = p->ecap;
 	}
-
-	phb4_pcicfg_write16(&p->phb, 0, ecap + PCICAP_EXP_DEVSTAT,
-			     PCICAP_EXP_DEVSTAT_CE	|
-			     PCICAP_EXP_DEVSTAT_NFE	|
-			     PCICAP_EXP_DEVSTAT_FE	|
-			     PCICAP_EXP_DEVSTAT_UE);
 
 	phb4_pcicfg_write16(&p->phb, 0, ecap + PCICAP_EXP_DEVCTL,
 			     PCICAP_EXP_DEVCTL_CE_REPORT	|
@@ -3558,25 +3780,18 @@ static bool phb4_init_rc_cfg(struct phb4 *p)
 		aercap = p->aercap;
 	}
 
-	/* Clear all UE status */
-	phb4_pcicfg_write32(&p->phb, 0, aercap + PCIECAP_AER_UE_STATUS,
-			     0xffffffff);
 	/* Disable some error reporting as per the PHB4 spec */
 	phb4_pcicfg_write32(&p->phb, 0, aercap + PCIECAP_AER_UE_MASK,
 			     PCIECAP_AER_UE_POISON_TLP		|
 			     PCIECAP_AER_UE_COMPL_TIMEOUT	|
 			     PCIECAP_AER_UE_COMPL_ABORT);
 
-	/* Clear all CE status */
-	phb4_pcicfg_write32(&p->phb, 0, aercap + PCIECAP_AER_CE_STATUS,
-			     0xffffffff);
 	/* Enable ECRC generation & checking */
 	phb4_pcicfg_write32(&p->phb, 0, aercap + PCIECAP_AER_CAPCTL,
 			     PCIECAP_AER_CAPCTL_ECRCG_EN	|
 			     PCIECAP_AER_CAPCTL_ECRCC_EN);
-	/* Clear root error status */
-	phb4_pcicfg_write32(&p->phb, 0, aercap + PCIECAP_AER_RERR_STA,
-			     0xffffffff);
+
+	phb4_rc_err_clear(p);
 
 	return true;
 }
@@ -3588,7 +3803,10 @@ static void phb4_init_errors(struct phb4 *p)
 	out_be64(p->regs + 0x1908,	0x0000000000000000ull);
 	out_be64(p->regs + 0x1920,	0x000000004d1780f8ull);
 	out_be64(p->regs + 0x1928,	0x0000000000000000ull);
-	out_be64(p->regs + 0x1930,	0xffffffffb2e87f07ull);
+	if (p->rev == PHB4_REV_NIMBUS_DD10)
+		out_be64(p->regs + 0x1930,	0xffffffffb2e87f07ull);
+	else
+		out_be64(p->regs + 0x1930,	0xffffffffb2f87f07ull);
 	out_be64(p->regs + 0x1940,	0x0000000000000000ull);
 	out_be64(p->regs + 0x1948,	0x0000000000000000ull);
 	out_be64(p->regs + 0x1950,	0x0000000000000000ull);
@@ -3597,18 +3815,24 @@ static void phb4_init_errors(struct phb4 *p)
 	/* Init_64..72 - REGB errors */
 	out_be64(p->regs + 0x1c00,	0xffffffffffffffffull);
 	out_be64(p->regs + 0x1c08,	0x0000000000000000ull);
-	out_be64(p->regs + 0x1c20,	0x2130006efca8bc00ull);
+	/* Enable/disable error status indicators that trigger irqs */
+	if (p->has_link) {
+		out_be64(p->regs + 0x1c20,	0x2130006efca8bc00ull);
+		out_be64(p->regs + 0x1c30,	0xde8fff91035743ffull);
+	} else {
+		out_be64(p->regs + 0x1c20,	0x0000000000000000ull);
+		out_be64(p->regs + 0x1c30,	0x0000000000000000ull);
+	}
 	out_be64(p->regs + 0x1c28,	0x0000000000000000ull);
-	out_be64(p->regs + 0x1c30,	0xde8fff91035743ffull);
 	out_be64(p->regs + 0x1c40,	0x0000000000000000ull);
 	out_be64(p->regs + 0x1c48,	0x0000000000000000ull);
 	out_be64(p->regs + 0x1c50,	0x0000000000000000ull);
-	out_be64(p->regs + 0x1c58,	0x0000000000000000ull);
+	out_be64(p->regs + 0x1c58,	0x0040000000000000ull);
 
 	/* Init_73..81 - TXE errors */
 	out_be64(p->regs + 0x0d00,	0xffffffffffffffffull);
 	out_be64(p->regs + 0x0d08,	0x0000000000000000ull);
-	out_be64(p->regs + 0x0d18,	0xffffffffffffffffull);
+	out_be64(p->regs + 0x0d18,	0xffffff0fffffffffull);
 	out_be64(p->regs + 0x0d28,	0x0000400a00000000ull);
 	out_be64(p->regs + 0x0d30,	0xdff7fd01f7ddfff0ull); /* XXX CAPI has diff. value */
 	out_be64(p->regs + 0x0d40,	0x0000000000000000ull);
@@ -3624,6 +3848,12 @@ static void phb4_init_errors(struct phb4 *p)
 		out_be64(p->regs + 0x0da8,	0xc00000b801000060ull);
 	else
 		out_be64(p->regs + 0x0da8,	0xc00008b801000060ull);
+	/*
+	 * Errata ER20161123 says we should set the top two bits in
+	 * 0x0db0 but this causes config space accesses which don't
+	 * get a response to fence the PHB. This breaks probing,
+	 * hence we don't set them here.
+	 */
 	out_be64(p->regs + 0x0db0,	0x3bffd703fe7fbf8full); /* XXX CAPI has diff. value */
 	out_be64(p->regs + 0x0dc0,	0x0000000000000000ull);
 	out_be64(p->regs + 0x0dc8,	0x0000000000000000ull);
@@ -3635,7 +3865,10 @@ static void phb4_init_errors(struct phb4 *p)
 	out_be64(p->regs + 0x0e08,	0x0000000000000000ull);
 	out_be64(p->regs + 0x0e18,	0xffffffffffffffffull);
 	out_be64(p->regs + 0x0e28,	0x0000600000000000ull);
-	out_be64(p->regs + 0x0e30,	0xffff9effff7fff57ull); /* XXX CAPI has diff. value */
+	if (p->rev == PHB4_REV_NIMBUS_DD10) /* XXX CAPI has diff. value */
+		out_be64(p->regs + 0x0e30,	0xffff9effff7fff57ull);
+	else
+		out_be64(p->regs + 0x0e30,	0xfffffeffff7fff57ull);
 	out_be64(p->regs + 0x0e40,	0x0000000000000000ull);
 	out_be64(p->regs + 0x0e48,	0x0000000000000000ull);
 	out_be64(p->regs + 0x0e50,	0x0000000000000000ull);
@@ -3734,16 +3967,13 @@ static void phb4_init_hw(struct phb4 *p, bool first_init)
 	PHBDBG(p, "New system config    : 0x%016llx\n",
 	       in_be64(p->regs + PHB_PCIE_SCR));
 
-	/* Init_5 - Wait for DLP PGRESET to clear */
-	/* This is broken in spec 053, moving that step to after Init_16 */
-
-	/* Init_6 - deassert CFG reset */
+	/* Init_5 - deassert CFG reset */
 	creset = in_be64(p->regs + PHB_PCIE_CRESET);
 	PHBDBG(p, "Initial PHB CRESET is 0x%016llx\n", creset);
 	creset &= ~PHB_PCIE_CRESET_CFG_CORE;
 	out_be64(p->regs + PHB_PCIE_CRESET,			creset);
 
-	/* Init_7..14 - PCIE DLP Lane EQ control */
+	/* Init_6..13 - PCIE DLP Lane EQ control */
 	if (p->lane_eq) {
 		out_be64(p->regs + PHB_PCIE_LANE_EQ_CNTL0, be64_to_cpu(p->lane_eq[0]));
 		out_be64(p->regs + PHB_PCIE_LANE_EQ_CNTL1, be64_to_cpu(p->lane_eq[1]));
@@ -3759,11 +3989,11 @@ static void phb4_init_hw(struct phb4 *p, bool first_init)
 		}
 	}
 
-	/* Init_15 - Clear link training */
+	/* Init_14 - Clear link training */
 	phb4_pcicfg_write32(&p->phb, 0, 0x78,
 			    0x07FE0000 | p->max_link_speed);
 
-	/* Init_16 - deassert cores reset */
+	/* Init_15 - deassert cores reset */
 	/*
 	 * Lift the PHB resets but not PERST, this will be lifted
 	 * later by the initial PERST state machine
@@ -3772,7 +4002,7 @@ static void phb4_init_hw(struct phb4 *p, bool first_init)
 	creset |= PHB_PCIE_CRESET_PIPE_N;
 	out_be64(p->regs + PHB_PCIE_CRESET,			   creset);
 
-	/* (Moved from Init_5) */
+	/* Init_16 - Wait for DLP PGRESET to clear */
 	if (!phb4_wait_dlp_reset(p))
 		goto failed;
 
@@ -3836,7 +4066,7 @@ static void phb4_init_hw(struct phb4 *p, bool first_init)
 
 	/* Init_126..130 - Re-enable error interrupts */
 	out_be64(p->regs + PHB_ERR_IRQ_ENABLE,			0xca8880cc00000000ull);
-	out_be64(p->regs + PHB_TXE_ERR_IRQ_ENABLE,		0x200840fe08200000ull);
+	out_be64(p->regs + PHB_TXE_ERR_IRQ_ENABLE,		0x2008400e08200000ull);
 	out_be64(p->regs + PHB_RXE_ARB_ERR_IRQ_ENABLE,		0xc40028fc01804070ull);
 	out_be64(p->regs + PHB_RXE_MRG_ERR_IRQ_ENABLE,		0x00006100008000a8ull);
 	if (p->rev == PHB4_REV_NIMBUS_DD10)
@@ -4556,9 +4786,12 @@ void probe_phb4(void)
 	struct dt_node *np;
 
 	verbose_eeh = nvram_query_eq("pci-eeh-verbose", "true");
+	/* REMOVEME: force this for now until we stabalise PCIe */
+	verbose_eeh = 1;
 	if (verbose_eeh)
 		prlog(PR_INFO, "PHB4: Verbose EEH enabled\n");
 
+	pci_tracing = nvram_query_eq("pci-tracing", "true");
 	/* Look for PBCQ XSCOM nodes */
 	dt_for_each_compatible(dt_root, np, "ibm,power9-pbcq")
 		phb4_probe_pbcq(np);
