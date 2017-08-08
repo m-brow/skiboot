@@ -58,6 +58,16 @@
 
 #define VENDOR_CAP_PCI_DEV_OFFSET 0x0d
 
+static bool is_p9dd1(void)
+{
+	struct proc_chip *chip = next_chip(NULL);
+
+	return chip &&
+	       (chip->type == PROC_CHIP_P9_NIMBUS ||
+		chip->type == PROC_CHIP_P9_CUMULUS) &&
+	       (chip->ec_level & 0xf0) == 0x10;
+}
+
 /*
  * We use the indirect method because it uses the same addresses as
  * the MMIO offsets (NPU RING)
@@ -65,26 +75,34 @@
 static void npu2_scom_set_addr(uint64_t gcid, uint64_t scom_base,
 			       uint64_t addr, uint64_t size)
 {
+	uint64_t isa = is_p9dd1() ? NPU2_DD1_MISC_SCOM_IND_SCOM_ADDR :
+				    NPU2_MISC_SCOM_IND_SCOM_ADDR;
+
 	addr = SETFIELD(NPU2_MISC_DA_ADDR, 0ull, addr);
 	addr = SETFIELD(NPU2_MISC_DA_LEN, addr, size);
-	xscom_write(gcid, scom_base + NPU2_MISC_SCOM_IND_SCOM_ADDR, addr);
+	xscom_write(gcid, scom_base + isa, addr);
 }
 
 static void npu2_scom_write(uint64_t gcid, uint64_t scom_base,
 			    uint64_t reg, uint64_t size,
 			    uint64_t val)
 {
+	uint64_t isd = is_p9dd1() ? NPU2_DD1_MISC_SCOM_IND_SCOM_DATA :
+				    NPU2_MISC_SCOM_IND_SCOM_DATA;
+
 	npu2_scom_set_addr(gcid, scom_base, reg, size);
-	xscom_write(gcid, scom_base + NPU2_MISC_SCOM_IND_SCOM_DATA, val);
+	xscom_write(gcid, scom_base + isd, val);
 }
 
 static uint64_t npu2_scom_read(uint64_t gcid, uint64_t scom_base,
 			       uint64_t reg, uint64_t size)
 {
 	uint64_t val;
+	uint64_t isd = is_p9dd1() ? NPU2_DD1_MISC_SCOM_IND_SCOM_DATA :
+				    NPU2_MISC_SCOM_IND_SCOM_DATA;
 
 	npu2_scom_set_addr(gcid, scom_base, reg, size);
-	xscom_read(gcid, scom_base + NPU2_MISC_SCOM_IND_SCOM_DATA, &val);
+	xscom_read(gcid, scom_base + isd, &val);
 
 	return val;
 }
@@ -180,12 +198,16 @@ static void npu2_read_bar(struct npu2 *p, struct npu2_bar *bar)
 		break;
 	case NPU2_NTL0_BAR:
 	case NPU2_NTL1_BAR:
-		bar->base = GETFIELD(NPU2_NTL_BAR_ADDR, val) << 17;
+		bar->base = GETFIELD(NPU2_NTL_BAR_ADDR, val) << 16;
 		enabled = GETFIELD(NPU2_NTL_BAR_ENABLE, val);
-		bar->size = 0x20000;
+
+		if (is_p9dd1())
+			bar->size = 0x20000;
+		else
+			bar->size = 0x10000 << GETFIELD(NPU2_NTL_BAR_SIZE, val);
 		break;
 	case NPU2_GENID_BAR:
-		bar->base = GETFIELD(NPU2_GENID_BAR_ADDR, val) << 17;
+		bar->base = GETFIELD(NPU2_GENID_BAR_ADDR, val) << 16;
 		enabled = GETFIELD(NPU2_GENID_BAR_ENABLE, val);
 		bar->size = 0x20000;
 		break;
@@ -214,11 +236,14 @@ static void npu2_write_bar(struct npu2 *p,
 		break;
 	case NPU2_NTL0_BAR:
 	case NPU2_NTL1_BAR:
-		val = SETFIELD(NPU2_NTL_BAR_ADDR, 0ul, bar->base >> 17);
+		val = SETFIELD(NPU2_NTL_BAR_ADDR, 0ul, bar->base >> 16);
 		val = SETFIELD(NPU2_NTL_BAR_ENABLE, val, enable);
+
+		if (!is_p9dd1())
+			val = SETFIELD(NPU2_NTL_BAR_SIZE, val, 1);
 		break;
 	case NPU2_GENID_BAR:
-		val = SETFIELD(NPU2_GENID_BAR_ADDR, 0ul, bar->base >> 17);
+		val = SETFIELD(NPU2_GENID_BAR_ADDR, 0ul, bar->base >> 16);
 		val = SETFIELD(NPU2_GENID_BAR_ENABLE, val, enable);
 		break;
 	default:
@@ -563,7 +588,7 @@ static int npu2_assign_gmb(struct npu2_dev *ndev)
 	struct npu2 *p = ndev->npu;
 	int peers, mode;
 	uint32_t bdfn;
-	uint64_t base, size, reg, gmb, old_val;
+	uint64_t base, size, reg, val, old_val, gmb;
 
 	/* Need to work out number of link peers. This amount to
 	 * working out the maximum function number. So work start at
@@ -579,15 +604,15 @@ static int npu2_assign_gmb(struct npu2_dev *ndev)
 
 	/* Base address is in GB */
 	base >>= 30;
-	gmb = SETFIELD(NPU2_MEM_BAR_SEL_MEM, 0ULL, 4);
-	gmb = SETFIELD(NPU2_MEM_BAR_NODE_ADDR, gmb, base);
-	gmb = SETFIELD(NPU2_MEM_BAR_GROUP | NPU2_MEM_BAR_CHIP, gmb, p->chip_id);
-	gmb = SETFIELD(NPU2_MEM_BAR_POISON, gmb, 1);
-	gmb = SETFIELD(NPU2_MEM_BAR_GRANULE, gmb, 0);
+	val = SETFIELD(NPU2_MEM_BAR_SEL_MEM, 0ULL, 4);
+	val = SETFIELD(NPU2_MEM_BAR_NODE_ADDR, val, base);
+	val = SETFIELD(NPU2_MEM_BAR_GROUP | NPU2_MEM_BAR_CHIP, val, p->chip_id);
+	val = SETFIELD(NPU2_MEM_BAR_POISON, val, 1);
+	val = SETFIELD(NPU2_MEM_BAR_GRANULE, val, 0);
 
 	/* We don't know how much memory the GPU has, so we may as well just
 	 * pass the whole aperture through at this point. */
-	gmb = SETFIELD(NPU2_MEM_BAR_BAR_SIZE, gmb, ilog2(size >> 30));
+	val = SETFIELD(NPU2_MEM_BAR_BAR_SIZE, val, ilog2(size >> 30));
 
 	switch (peers) {
 	case 0:
@@ -611,29 +636,33 @@ static int npu2_assign_gmb(struct npu2_dev *ndev)
 	}
 
 	mode += ndev->bdfn & 0x7;
-	gmb = SETFIELD(NPU2_MEM_BAR_MODE, gmb, mode);
-	if (NPU2DEV_BRICK(ndev))
-		gmb >>= 32;
-	reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_0 + NPU2DEV_STACK(ndev),
-			      NPU2_BLOCK_SM_0,
-			      NPU2_GPU0_MEM_BAR);
+	val = SETFIELD(NPU2_MEM_BAR_MODE, val, mode);
 
-	old_val = npu2_read(p, reg);
-	gmb |= old_val;
+	gmb = NPU2_GPU0_MEM_BAR;
+	if (NPU2DEV_BRICK(ndev) && !is_p9dd1())
+		gmb = NPU2_GPU1_MEM_BAR;
 
-	npu2_write(p, reg, gmb);
 	reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_0 + NPU2DEV_STACK(ndev),
-			      NPU2_BLOCK_SM_1,
-			      NPU2_GPU0_MEM_BAR);
-	npu2_write(p, reg, gmb);
+			      NPU2_BLOCK_SM_0, gmb);
+
+	if (is_p9dd1()) {
+		old_val = npu2_read(p, reg);
+		if (NPU2DEV_BRICK(ndev))
+			val = SETFIELD(PPC_BITMASK(32, 63), old_val, val >> 32);
+		else
+			val = SETFIELD(PPC_BITMASK(0, 31), old_val, val >> 32);
+	}
+
+	npu2_write(p, reg, val);
 	reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_0 + NPU2DEV_STACK(ndev),
-			      NPU2_BLOCK_SM_2,
-			      NPU2_GPU0_MEM_BAR);
-	npu2_write(p, reg, gmb);
+			      NPU2_BLOCK_SM_1, gmb);
+	npu2_write(p, reg, val);
 	reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_0 + NPU2DEV_STACK(ndev),
-			      NPU2_BLOCK_SM_3,
-			      NPU2_GPU0_MEM_BAR);
-	npu2_write(p, reg, gmb);
+			      NPU2_BLOCK_SM_2, gmb);
+	npu2_write(p, reg, val);
+	reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_0 + NPU2DEV_STACK(ndev),
+			      NPU2_BLOCK_SM_3, gmb);
+	npu2_write(p, reg, val);
 
 	return 0;
 }
@@ -754,6 +783,11 @@ static void npu2_hw_init(struct npu2 *p)
 	/* Enable XTS retry mode */
 	val = npu2_read(p, NPU2_XTS_CFG);
 	npu2_write(p, NPU2_XTS_CFG, val | NPU2_XTS_CFG_MMIOSD | NPU2_XTS_CFG_TRY_ATR_RO);
+
+	if (!is_p9dd1()) {
+		val = npu2_read(p, NPU2_XTS_CFG2);
+		npu2_write(p, NPU2_XTS_CFG2, val | NPU2_XTS_CFG2_NO_FLUSH_ENA);
+	}
 
 	/* Init memory cache directory (MCD) registers. */
 	phys_map_get(p->chip_id, GPU_MEM, NPU2_LINKS_PER_CHIP - 1,
@@ -1125,18 +1159,15 @@ static void assign_mmio_bars(uint64_t gcid, uint32_t scom, uint64_t reg[2], uint
 	uint32_t i;
 	struct npu2_bar *bar;
 	struct npu2_bar npu2_bars[] = {
-		/*
-		 * NPU_REGS must be first in this list, at least on DD1.
-		 * On DD2, stack 0 will be used for NPU_REGS, stack 1/2 for NPU_PHY.
-		 */
+		/* NPU_REGS must be first in this list */
 		{ .type = NPU_REGS, .index = 0,
-		  .reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_2, 0, NPU2_PHY_BAR),
-		  .flags = NPU2_BAR_FLAG_ENABLED },
-		{ .type = NPU_PHY, .index = 0,
 		  .reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_0, 0, NPU2_PHY_BAR),
 		  .flags = NPU2_BAR_FLAG_ENABLED },
-		{ .type = NPU_PHY, .index = 1,
+		{ .type = NPU_PHY, .index = 0,
 		  .reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_1, 0, NPU2_PHY_BAR),
+		  .flags = NPU2_BAR_FLAG_ENABLED },
+		{ .type = NPU_PHY, .index = 1,
+		  .reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_2, 0, NPU2_PHY_BAR),
 		  .flags = NPU2_BAR_FLAG_ENABLED },
 		{ .type = NPU_NTL, .index = 0,
 		  .reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_0, 0, NPU2_NTL0_BAR) },
@@ -1157,6 +1188,13 @@ static void assign_mmio_bars(uint64_t gcid, uint32_t scom, uint64_t reg[2], uint
 		{ .type = NPU_GENID, .index = 2,
 		  .reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_2, 0, NPU2_GENID_BAR) },
 	};
+
+	/* On DD1, stack 2 was used for NPU_REGS, stack 0/1 for NPU_PHY */
+	if (is_p9dd1()) {
+		npu2_bars[0].reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_2, 0, NPU2_PHY_BAR);
+		npu2_bars[1].reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_0, 0, NPU2_PHY_BAR);
+		npu2_bars[2].reg = NPU2_REG_OFFSET(NPU2_STACK_STCK_1, 0, NPU2_PHY_BAR);
+	}
 
 	for (i = 0; i < ARRAY_SIZE(npu2_bars); i++) {
 		bar = &npu2_bars[i];
@@ -1193,9 +1231,45 @@ static void npu2_probe_phb(struct dt_node *dn)
 	path = dt_get_path(dn);
 	gcid = dt_get_chip_id(dn);
 	assert(proc_chip = get_chip(gcid));
-	if ((proc_chip->ec_level & 0xf0) != 0x10) {
+	if ((proc_chip->ec_level & 0xf0) > 0x20) {
 		prerror("NPU2: unsupported ec level on Chip 0x%x!\n", gcid);
 		return;
+	}
+
+	if (!is_p9dd1()) {
+		/* TODO: Clean this up with register names, etc. when we get
+		 * time. This just turns NVLink mode on in each brick and should
+		 * get replaced with a patch from ajd once we've worked out how
+		 * things are going to work there.
+		 *
+		 * Obviously if the year is now 2020 that didn't happen and you
+		 * should fix this :-) */
+		xscom_write_mask(gcid, 0x5011000, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
+		xscom_write_mask(gcid, 0x5011030, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
+		xscom_write_mask(gcid, 0x5011060, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
+		xscom_write_mask(gcid, 0x5011090, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
+		xscom_write_mask(gcid, 0x5011200, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
+		xscom_write_mask(gcid, 0x5011230, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
+		xscom_write_mask(gcid, 0x5011260, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
+		xscom_write_mask(gcid, 0x5011290, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
+		xscom_write_mask(gcid, 0x5011400, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
+		xscom_write_mask(gcid, 0x5011430, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
+		xscom_write_mask(gcid, 0x5011460, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
+		xscom_write_mask(gcid, 0x5011490, PPC_BIT(58), PPC_BIT(6) | PPC_BIT(58));
+
+		xscom_write_mask(gcid, 0x50110c0, PPC_BIT(53), PPC_BIT(53));
+		xscom_write_mask(gcid, 0x50112c0, PPC_BIT(53), PPC_BIT(53));
+		xscom_write_mask(gcid, 0x50114c0, PPC_BIT(53), PPC_BIT(53));
+		xscom_write_mask(gcid, 0x50110f1, PPC_BIT(41), PPC_BIT(41));
+		xscom_write_mask(gcid, 0x50112f1, PPC_BIT(41), PPC_BIT(41));
+		xscom_write_mask(gcid, 0x50114f1, PPC_BIT(41), PPC_BIT(41));
+
+		xscom_write_mask(gcid, 0x5011110, PPC_BIT(0), PPC_BIT(0));
+		xscom_write_mask(gcid, 0x5011130, PPC_BIT(0), PPC_BIT(0));
+		xscom_write_mask(gcid, 0x5011310, PPC_BIT(0), PPC_BIT(0));
+		xscom_write_mask(gcid, 0x5011330, PPC_BIT(0), PPC_BIT(0));
+		xscom_write_mask(gcid, 0x5011510, PPC_BIT(0), PPC_BIT(0));
+		xscom_write_mask(gcid, 0x5011530, PPC_BIT(0), PPC_BIT(0));
 	}
 
 	index = dt_prop_get_u32(dn, "ibm,npu-index");

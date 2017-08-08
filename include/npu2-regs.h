@@ -101,6 +101,7 @@ void npu2_write_mask(struct npu2 *p, uint64_t reg, uint64_t val, uint64_t mask);
 #define NPU2_PB_EPSILON				0x010
 #define NPU2_TIMER_CFG				0x018
 #define NPU2_GPU0_MEM_BAR			0x020
+#define NPU2_GPU1_MEM_BAR			0x028
 #define   NPU2_MEM_BAR_SEL_MEM			PPC_BITMASK(0,2)
 #define   NPU2_MEM_BAR_GROUP			PPC_BITMASK(3,6)
 #define   NPU2_MEM_BAR_CHIP			PPC_BITMASK(7,9)
@@ -121,8 +122,9 @@ void npu2_write_mask(struct npu2 *p, uint64_t reg, uint64_t val, uint64_t mask);
 #define   NPU2_GENID_BAR_ENABLE			PPC_BIT(0)
 #define   NPU2_GENID_BAR_GROUP			PPC_BITMASK(3,6)
 #define   NPU2_GENID_BAR_CHIP			PPC_BITMASK(7,9)
-#define   NPU2_GENID_BAR_NODE_ADDR		PPC_BITMASK(10,34)
-#define   NPU2_GENID_BAR_ADDR			PPC_BITMASK(3,34)
+#define   NPU2_GENID_BAR_NODE_ADDR		PPC_BITMASK(10,35)
+#define   NPU2_GENID_BAR_ADDR			PPC_BITMASK(3,35)
+#define   NPU2_GENID_BAR_POISON			PPC_BIT(39)
 #define NPU2_LOW_WATER_MARKS			0x040
 #define NPU2_HIGH_WATER_MARKS			0x048
 #define NPU2_RELAXED_ORDERING_CFG0		0x050
@@ -133,8 +135,10 @@ void npu2_write_mask(struct npu2 *p, uint64_t reg, uint64_t val, uint64_t mask);
 #define   NPU2_NTL_BAR_ENABLE			PPC_BIT(0)
 #define   NPU2_NTL_BAR_GROUP			PPC_BITMASK(3,6)
 #define   NPU2_NTL_BAR_CHIP			PPC_BITMASK(7,9)
-#define   NPU2_NTL_BAR_NODE_ADDR		PPC_BITMASK(10,34)
-#define   NPU2_NTL_BAR_ADDR			PPC_BITMASK(3,34)
+#define   NPU2_NTL_BAR_NODE_ADDR		PPC_BITMASK(10,35)
+#define   NPU2_NTL_BAR_ADDR			PPC_BITMASK(3,35)
+#define   NPU2_NTL_BAR_POISON			PPC_BIT(36)
+#define   NPU2_NTL_BAR_SIZE			PPC_BITMASK(39,43)
 #define NPU2_PERF_CFG				0x078
 #define NPU2_INHIBIT_CFG			0x080
 #define NPU2_C_ERR_RPT_MSG0			0x088
@@ -395,6 +399,7 @@ void npu2_write_mask(struct npu2 *p, uint64_t reg, uint64_t val, uint64_t mask);
 #define   NPU2_XTS_CFG_MMIOSD			PPC_BIT(1)
 #define   NPU2_XTS_CFG_TRY_ATR_RO		PPC_BIT(6)
 #define NPU2_XTS_CFG2				NPU2_REG_OFFSET(NPU2_STACK_MISC, NPU2_BLOCK_XTS, 0x028)
+#define   NPU2_XTS_CFG2_NO_FLUSH_ENA		PPC_BIT(49)
 #define NPU2_XTS_DBG_CFG0			NPU2_REG_OFFSET(NPU2_STACK_MISC, NPU2_BLOCK_XTS, 0x030)
 #define NPU2_XTS_DBG_CFG1			NPU2_REG_OFFSET(NPU2_STACK_MISC, NPU2_BLOCK_XTS, 0x038)
 #define NPU2_XTS_PMU_CNT			NPU2_REG_OFFSET(NPU2_STACK_MISC, NPU2_BLOCK_XTS, 0x040)
@@ -441,11 +446,13 @@ void npu2_write_mask(struct npu2 *p, uint64_t reg, uint64_t val, uint64_t mask);
 #define NPU2_XTS_MMIO_ATSD_STATUS		0x010
 
 /* ALTD SCOM addresses */
-#define NPU2_MISC_SCOM_IND_SCOM_ADDR		0x38e
+#define NPU2_DD1_MISC_SCOM_IND_SCOM_ADDR	0x38e
+#define NPU2_MISC_SCOM_IND_SCOM_ADDR		0x68e
 #define  NPU2_MISC_DA_ADDR			PPC_BITMASK(0, 23)
 #define  NPU2_MISC_DA_LEN			PPC_BITMASK(24, 25)
 #define   NPU2_MISC_DA_LEN_4B			2
 #define   NPU2_MISC_DA_LEN_8B			3
-#define NPU2_MISC_SCOM_IND_SCOM_DATA   		0x38f
+#define NPU2_DD1_MISC_SCOM_IND_SCOM_DATA	0x38f
+#define NPU2_MISC_SCOM_IND_SCOM_DATA		0x68f
 
 #endif /* __NPU2_REGS_H */
