@@ -272,4 +272,7 @@ struct dt_node *dt_find_by_name_addr(struct dt_node *parent, const char *name,
 void dt_adjust_subtree_phandle(struct dt_node *subtree,
 				const char** (get_properties_to_fix)(struct dt_node *n));
 
+/* Print device tree node full path */
+int print_dt_node_path(char **buffer, size_t bufsize, void *value);
+
 #endif /* __DEVICE_H */

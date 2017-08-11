@@ -451,6 +451,7 @@ static struct dt_property *new_property(struct dt_node *node,
 	p->name = take_name(name);
 	p->len = size;
 	list_add_tail(&node->properties, &p->list);
+	prlog(PR_PRINTF, "Testing DT node full path printing: %pD \n", node);
 	return p;
 }
 
@@ -1107,3 +1108,27 @@ void dt_adjust_subtree_phandle(struct dt_node *dev,
 
        set_last_phandle(max_phandle);
 }
+
+int print_dt_node_path(char **buffer, size_t bufsize, void *value)
+{
+	char *bstart = *buffer;
+
+	/* Create string of dt_node full path */
+	struct dt_node *n = (struct dt_node *)value;
+	char *p = dt_get_path(n);
+	int i = 0;
+	/* Print the string to the buffer */
+	for (i = 0; (i < strlen(p)) && ((*buffer - bstart) < bufsize); i++) {
+		**buffer = p[i];
+		*buffer += 1;
+	}
+	/* Return length of string */
+	return 0;
+}
+
+/* Setup DT node path custom print specifier */
+DECLARE_PRINTFMT(dt_node_path) = {
+	.format_specifier       = "%pD",
+	.print_func             = &print_dt_node_path,
+};
+

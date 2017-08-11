@@ -17,6 +17,18 @@
 #include "string.h"
 #include "ctype.h"
 
+
+
+struct custom_format {
+	/* Custom specifier string */
+	char *format_specifier;
+	/* Print function takes the struct and returns a char pointer */
+	int (*print_func) (char **buffer, size_t bufsize, void *value);
+};
+
+
+static void *custom_print_start = &__print_start;
+
 static const unsigned long long convert[] = {
 	0x0, 0xFF, 0xFFFF, 0xFFFFFF, 0xFFFFFFFF,
 	0xFFFFFFFFFFULL, 0xFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL
@@ -123,10 +135,88 @@ print_fill(char **buffer, size_t bufsize, char *sizec, unsigned long size,
 	return 0;
 }
 
+/*
+ * Check if input string matches or is a substring of the
+ * custom specifiers.
+ *
+ * Return true is strings match / are substrings.
+ * If strings match exactly, the res pointer is set to the corresponding
+ * custom format specifier struct.
+ */
+static bool check_specifier_substring(const char *format,
+				      struct custom_format **res)
+{
+	int list_len, format_len, spec_len, i;
+	struct custom_format *print_fmt;
+	char *spec;
+
+	print_fmt = (struct custom_format *)custom_print_start;
+	list_len  = (&__print_start - &__print_end) / 
+			sizeof(struct custom_format);
+	format_len = strlen(format);
+
+	for (i = 0; i < list_len; i++) {
+		spec = print_fmt[i].format_specifier;
+		spec_len = strlen(spec);
+
+		/* Input string is larger than specifier string */
+		if (format_len > spec_len)
+			continue;
+
+		/* if spec_len == format_len */
+		if (!strcmp(spec, format)) {
+			*res = &print_fmt[i];
+			return true;
+		}
+		/* if spec_len > format_len */
+		if (!strncmp(spec, format, format_len)) {
+			return true;
+		}
+	
+	}
+	return false;
+}
+
+#if 0
+/*
+ * Check if custom print specifier is valid.
+ * Returns a pointer to the corresponding custom_format struct
+ * if they match.
+ * Return NULL pointer if no custom formats match.
+ */
+static struct custom_format *check_custom_specifiers(const char *format)
+{
+	int i, j, list_len, format_len, spec_len;
+	char *spec;
+	struct custom_format *custom_print = 
+		(struct custom_format *)custom_print_start;
+
+	len = (&__print_start - &__print_end) / sizeof(struct custom_format);
+	format_len = strlen(format);
+
+	for (i = 0; i < len; i++) {
+		spec = (char *)custom_print[i].format_specifier;
+		spec_len = strlen(spec);
+
+		// if format_len < spec_len
+		j = 0;
+
+		while (spec[j] != '\0' && format[j] != '\0') {
+			if (spec[j] != format[j])
+				continue;
+			j++;
+		}
+		return (custom_print + i);
+	}
+
+	return NULL;
+}
+#endif
 
 static int
 print_format(char **buffer, size_t bufsize, const char *format, void *var)
 {
+	struct custom_format *cust_format;
 	char *start;
 	unsigned int i = 0, length_mod = sizeof(int);
 	unsigned long value = 0;
@@ -134,7 +224,7 @@ print_format(char **buffer, size_t bufsize, const char *format, void *var)
 	char *form, sizec[32];
 	char sign = ' ';
 	bool upper = false;
-
+	bool valid = false;
 	form  = (char *) format;
 	start = *buffer;
 
@@ -142,6 +232,14 @@ print_format(char **buffer, size_t bufsize, const char *format, void *var)
 	if(*form == '0' || *form == '.') {
 		sign = '0';
 		form++;
+	}
+
+	valid = check_specifier_substring(format, &cust_format);
+
+	/* Print the custom format specifier */
+	if (valid && cust_format) {
+		cust_format->print_func	(buffer, bufsize, var);
+		return (long int) (*buffer - start);
 	}
 
 	while ((*form != '\0') && ((*buffer - start) < bufsize)) {
@@ -238,7 +336,99 @@ print_format(char **buffer, size_t bufsize, const char *format, void *var)
 	
 	return (long int) (*buffer - start);
 }
+#if 0
+/*
+ * Check if the format specifier is at the end of a sequence.
+ * Return false if we reach a terminating character of the specifier.
+ */
+static bool check_format_specifier(char *format, char *buff, int length)
+{
+	struct custom_format *fmt_check;
+	char *fullstr;
 
+	char last = format[length - 1];
+
+	if (last == '\0' || last == ' ')
+		return false;
+
+	/* Check if format matches are custom specifiers */
+	// should return true if it is a substring
+	bool term_char = check_specifier_substring(format, &fmt_check);
+	
+	/* Matches a custom specifier */
+	if (term_char && fmt_check)
+		return false;
+
+	/* Substring of custom specifier */
+	if (term_char)
+		return true;
+
+	/* Need case for when there is an invalid custom specifier e.g. %px */
+	
+#if 1
+	if (last == 'p') {
+		// concat the format and buff strings
+		// buff - length = format[0];
+
+		char small_str = buff[0];
+		fullstr = strcat(format, &small_str);
+		term_char = check_specifier_substring(fullstr, &fmt_check);
+
+		/* String is not a substring of a custom specifier
+		 * Stop looking for 
+		 */
+//		if (!term_char)
+//			return false;
+	}
+#endif
+	/* Check for terminating format specifier characters */
+	if (last == 'd' || last == 'i' || last == 'u' || last == 'x' ||
+	    last == 'X' || last == 'c' || last == 's' || last == '%' ||
+	    last == 'O' || last == 'o')
+		return false;
+
+	return true;
+}
+#endif
+/*
+ * Using ptr look for any matching custom specifiers.
+ * If we find a matching one, write it to 'format'.
+ * Return true - custom specifier found
+ */
+static bool find_custom_specifiers(char **format, char **ptr, int *i)
+{
+	struct custom_format *fmt;
+	char tmp_fmt[15];
+	char *fmt_str;
+	bool is_cust;
+	char *spec;
+
+	strncpy(tmp_fmt, *ptr, 15);
+	
+	is_cust = check_specifier_substring(tmp_fmt, &fmt);
+
+	if (!is_cust || (is_cust && !fmt))
+		return false;
+
+	/* Using the fmt struct, copy the fmt.format_specifier to format
+	 * Also increment the ptr and i values by the length of the specifier
+	 */
+
+	spec = fmt->format_specifier;
+	fmt_str = *format;
+
+	while (*spec != '\0') {
+		*fmt_str = *spec;
+		fmt_str++;
+		spec++;
+		(*ptr)++;
+		(*i)++;
+	}
+	*fmt_str = '\0';
+
+
+	return true;
+}
 
 /*
  * The vsnprintf function prints a formatted strings into a buffer.
@@ -266,20 +456,33 @@ vsnprintf(char *buffer, size_t bufsize, const char *format, va_list arg)
 	{
 		if(*ptr == '%') {
 			char formstr[20];
-			int i=0;
-			
-			do {
-				formstr[i] = *ptr;
-				ptr++;
-				i++;
-			} while(!(*ptr == 'd' || *ptr == 'i' || *ptr == 'u' || *ptr == 'x' || *ptr == 'X'
-						|| *ptr == 'p' || *ptr == 'c' || *ptr == 's' || *ptr == '%'
-						|| *ptr == 'O' || *ptr == 'o' )); 
-			formstr[i++] = *ptr;
-			formstr[i] = '\0';
+			int i = 0;
+			/* Finds any custom specifiers */
+			bool cust = find_custom_specifiers((char **)&formstr, &ptr, &i);
+
+			if (!cust) {
+				do {
+					formstr[i] = *ptr;
+					ptr++;
+					i++;
+				} while(!(*ptr == 'd' || *ptr == 'i' ||
+					  *ptr == 'u' || *ptr == 'x' ||
+					  *ptr == 'X' || *ptr == 'p' ||
+					  *ptr == 's' || *ptr == '%' ||
+					  *ptr == 'O' || *ptr == 'o'));
+
+				/* Add last char to buffer*/
+				formstr[i++] = *ptr;
+				formstr[i] = '\0';
+			}
+
 			if(*ptr == '%') {
 				*buffer++ = '%';
 			} else {
+				/*
+				 * This changes the format specifier into the
+				 * actual string.
+				 */
 				print_format(&buffer,
 					bufsize - (buffer - bstart),
 					formstr, va_arg(arg, void *));

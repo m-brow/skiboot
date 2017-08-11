@@ -115,6 +115,12 @@ SECTIONS
 		__platforms_end = .;
 	}
 
+	.print : {
+		__print_start = .;
+		KEEP(*(.print))
+		__print_end = .;
+	}
+
 	/* Do I need to keep these ? */
 	.dynsym : { *(.dynsym)	}
 	.dynstr : { *(.dynstr)	}

@@ -316,5 +316,14 @@ extern int occ_sensor_read(u32 handle, u32 *data);
 extern int occ_sensor_group_clear(u32 group_hndl, int token);
 extern void occ_add_sensor_groups(struct dt_node *sg, u32  *phandles,
 				  int nr_phandles, int chipid);
+struct custom_format {
+	/* Custome specifier string */
+	const char *format_specifier;
+	/* Print function takes the struct and returns a char pointer */
+	int (*print_func) (char **buffer, size_t bufsize, void *value);
+};
+
+#define DECLARE_PRINTFMT(name)\
+static const struct custom_format __used __section(".print") name ##_print
 
 #endif /* __SKIBOOT_H */

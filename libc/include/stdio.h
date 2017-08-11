@@ -69,4 +69,6 @@ int vsscanf(const char *str, const char *format, va_list);
 int getc(FILE *stream);
 int getchar(void);
 
+extern void *__print_start;
+extern void *__print_end;
 #endif
